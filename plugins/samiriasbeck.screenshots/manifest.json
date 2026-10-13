@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "samiriasbeck.screenshots",
+  "name": "Recent screenshots",
+  "version": "1.0.0",
+  "author": "samiriasbeck",
+  "license": "MIT",
+  "description": "Bar button that lists the last 10 screenshots with thumbnails, copy and drag-out.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Screenshots",
+    "description": "Last 10 screenshots: copy or drag into another app",
+    "category": "Utilities",
+    "allowMultiple": false,
+    "defaultSection": "center"
+  }
+}

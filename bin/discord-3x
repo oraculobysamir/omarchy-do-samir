@@ -1,0 +1,106 @@
+#!/bin/bash
+# discord-3x — abre os 3 Discords lado a lado, priorizando o monitor grande (34").
+# Discord 1 = app nativo, Conta 2 = .desktop próprio, Conta 3 = .desktop próprio.
+# Com monitor grande conectado, os três vão para a mesa que está nele;
+# sem monitor grande (ex.: Deck), vão para a mesa $WS. Nada é duplicado.
+set -euo pipefail
+
+WS="${DISCORD_3X_WS:-1}"
+APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+
+# Nome do monitor grande (34"): "ULTRAWIDE" na descrição; senão, o mais largo
+# (não-eDP) com >= 2560 px. Vazio = sem monitor grande.
+detect_big_monitor() {
+  local m
+  m=$(hyprctl monitors -j 2>/dev/null | jq -r '[.[] | select((.description // "") | test("ultrawide"; "i")) | .name][0] // empty')
+  if [[ -z $m ]]; then
+    m=$(hyprctl monitors -j 2>/dev/null | jq -r '[.[] | select((.name | test("^eDP") | not) and .width >= 2560) | {w: .width, n: .name}] | sort_by(-.w) | .[0].n // empty')
+  fi
+  printf '%s' "$m"
+}
+
+# Mesa ativa do monitor dado (vazio se não achar).
+monitor_workspace() {
+  hyprctl monitors -j 2>/dev/null | jq -r --arg m "$1" '.[] | select(.name == $m) | (.activeWorkspace.id | tostring)' | head -1
+}
+
+exec_of() {
+  local f cmd
+  f="$APPS_DIR/$1"
+  [[ -f $f ]] || f="/usr/share/applications/$1"
+  cmd=$(grep -m1 '^Exec=' "$f" | cut -d= -f2- | sed 's/ %[uUfF]//g')
+  printf '%s' "$cmd"
+}
+
+addrs_for() {
+  hyprctl clients -j 2>/dev/null | jq -r \
+    --arg rc "$1" --arg rt "$2" \
+    '.[] | select((.class | test($rc; "i")) and ($rt == "" or (.title | test($rt; "i")))) | .address'
+}
+
+# Variante OU: (classe ~ rc1 [e título ~ rt1]) ou (classe ~ rc2 e título ~ rt2).
+# Serve à Conta 2, que é classe derivada no Chromium (Deck) e google-chrome
+# genérico + título no Chrome (ThinkPad).
+addrs_for_either() {
+  hyprctl clients -j 2>/dev/null | jq -r \
+    --arg a "$1" --arg b "$2" --arg c "$3" --arg d "$4" \
+    '.[] | select(((.class | test($a; "i")) and ($b == "" or (.title | test($b; "i")))) or ((.class | test($c; "i")) and (.title | test($d; "i")))) | .address'
+}
+
+match_addrs() {
+  if [[ -n ${3:-} ]]; then
+    addrs_for_either "$1" "$2" "$3" "$4"
+  else
+    addrs_for "$1" "$2"
+  fi
+}
+
+ensure_open() {
+  local class_re=$1 title_re=$2 desktop=$3 class_re2=${4:-} title_re2=${5:-}
+  local -a addrs=()
+  mapfile -t addrs < <(match_addrs "$class_re" "$title_re" "$class_re2" "$title_re2")
+  if ((${#addrs[@]} == 0)); then
+    # shellcheck disable=SC2086
+    setsid -f $(exec_of "$desktop") >/dev/null 2>&1 < /dev/null || true
+    local end=$((SECONDS + 15)) found=0 addr
+    while ((SECONDS < end)); do
+      sleep 1
+      mapfile -t addrs < <(match_addrs "$class_re" "$title_re" "$class_re2" "$title_re2")
+      ((${#addrs[@]})) && { found=1; break; }
+    done
+    ((found)) || return 1
+  fi
+  printf '%s ' "${addrs[@]}"
+  echo
+  return 0
+}
+
+move_to_ws() {
+  hyprctl dispatch "hl.dsp.window.move({ window = \"address:$1\", workspace = \"$WS\", follow = false })" >/dev/null 2>&1 || true
+}
+
+main() {
+  local a1 a2 a3 fail=0 target=$WS mon monws
+  mon=$(detect_big_monitor)
+  if [[ -n $mon ]]; then
+    monws=$(monitor_workspace "$mon")
+    if [[ $monws =~ ^[1-9][0-9]*$ ]]; then
+      target=$monws
+      echo "monitor grande: $mon (mesa $target)"
+    else
+      echo "monitor $mon sem mesa ativa; usando mesa $WS" >&2
+    fi
+  else
+    echo "sem monitor grande; usando mesa $WS"
+  fi
+  WS=$target
+  a1=$(ensure_open '^discord$' '' 'discord.desktop') || { echo "discord 1 não abriu" >&2; fail=1; }
+  a2=$(ensure_open '^chrome-discord\.com__channels_@me-' '' 'discord-conta2.desktop' '^google-chrome$' 'Discord') || { echo "conta 2 não abriu" >&2; fail=1; }
+  a3=$(ensure_open '^firefox$' 'Discord' 'discord-conta3.desktop') || { echo "conta 3 não abriu" >&2; fail=1; }
+  local a
+  for a in ${a1:-} ${a2:-} ${a3:-}; do move_to_ws "$a"; done
+  hyprctl dispatch "hl.dsp.focus({ workspace = \"$WS\" })" >/dev/null 2>&1 || true
+  return $fail
+}
+
+main "$@"

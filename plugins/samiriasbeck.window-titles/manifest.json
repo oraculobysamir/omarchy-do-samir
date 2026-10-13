@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "samiriasbeck.window-titles",
+  "name": "Window titles",
+  "version": "1.0.0",
+  "author": "samiriasbeck",
+  "license": "MIT",
+  "description": "Tiny discrete labels on tiled windows so you can tell Cursor from Gymnite (and friends) at a glance.",
+  "kinds": ["panel"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "panel": "Overlay.qml"
+  }
+}

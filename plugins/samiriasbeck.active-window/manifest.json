@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "samiriasbeck.active-window",
+  "name": "Active window (app first)",
+  "version": "1.0.0",
+  "author": "samiriasbeck",
+  "license": "MIT",
+  "description": "Focused window label with the app name first (Cursor CLI, Telegram, Claude Code…).",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "ActiveWindow.qml"
+  },
+  "barWidget": {
+    "displayName": "Active window (app)",
+    "description": "App — title for the focused window",
+    "category": "Compositor",
+    "allowMultiple": false,
+    "defaultSection": "left",
+    "defaults": { "maxWidth": 280 }
+  }
+}

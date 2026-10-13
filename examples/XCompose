@@ -1,0 +1,16 @@
+# Run omarchy-restart-xcompose to apply changes
+#
+# libxkbcommon: last matching sequence wins, so cedilla overrides MUST
+# come after include "%L" / Omarchy defaults (otherwise 'c becomes ć).
+
+include "/usr/share/omarchy/default/xcompose"
+
+# macOS US International style: ' then c → ç (not ć)
+<dead_acute> <c> : "ç"
+<dead_acute> <C> : "Ç"
+<Multi_key> <apostrophe> <c> : "ç"
+<Multi_key> <apostrophe> <C> : "Ç"
+<Multi_key> <acute> <c> : "ç"
+<Multi_key> <acute> <C> : "Ç"
+<Multi_key> <c> <apostrophe> : "ç"
+<Multi_key> <C> <apostrophe> : "Ç"

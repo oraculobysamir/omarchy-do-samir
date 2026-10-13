@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Name=Discord Conta 2
+Comment=Segunda conta do Discord (via Chrome)
+Exec=/usr/bin/google-chrome-stable --app="https://discord.com/channels/@me"
+Terminal=false
+Type=Application
+Icon=discord
+StartupNotify=true
+StartupWMClass=google-chrome
+Categories=Chat;Network;

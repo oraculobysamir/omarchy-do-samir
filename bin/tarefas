@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+# tarefas — organizador de projetos e tarefas para as CLIs de agente.
+#
+# Ideia única: PASTA = TAREFA.
+#   ~/Projetos/<projeto>/PROJETO.md            contexto geral do projeto
+#   ~/Projetos/<projeto>/<tarefa>/TAREFA.md    memória durável da tarefa (vale para qualquer CLI:
+#                                              CLAUDE.md, AGENTS.md e GEMINI.md são atalhos para ele)
+# A CLI abre DENTRO da pasta e continua a última conversa daquela pasta. Voltar a um assunto
+# é só escolher a pastinha de novo.
+#
+# Uso:
+#   tarefas                      seletor em árvore → escolhe a CLI → roda neste terminal
+#   tarefas --janela             igual, mas abre a CLI numa janela nova (usado pelo SUPER + R)
+#   tarefas novo-projeto "Nome"              cria o projeto e imprime a pasta
+#   tarefas nova-tarefa <pasta-do-projeto> "Nome"   cria a tarefa e imprime a pasta
+#   tarefas salva "frase"        nesta pasta: linha Último + próximo nº no Histórico
+#   tarefas numerar              numera o Histórico de todas as tarefas (não muda a data)
+#   tarefas lista                imprime a árvore (texto puro)
+#   tarefas indice <projeto>     tarefas numeradas, para o preview do SUPER+R
+set -uo pipefail
+
+ROOT="${TAREFAS_DIR:-$HOME/Projetos}"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+HOJE="$(date +%F)"
+
+# id da CLI (= nome do binário) na ordem em que aparecem no seletor.
+CLIS=(claude codex cursor-agent agy gemini muse opencode pi)
+declare -A ROTULO=(
+  [claude]="Claude Code" [codex]="Codex" [cursor-agent]="Cursor CLI" [agy]="Antigravity (Gemini)"
+  [gemini]="Gemini CLI" [muse]="Muse Code" [opencode]="OpenCode" [pi]="Pi"
+)
+# Argumentos que fazem cada CLI continuar a última conversa DESTA pasta.
+declare -A CONTINUA=(
+  [claude]="--continue" [codex]="resume --last" [cursor-agent]="--continue" [agy]="--continue"
+  [gemini]="--resume latest" [muse]="resume --last" [opencode]="--continue" [pi]="--continue"
+)
+
+slug() {
+  local s
+  s=$(printf '%s' "$1" | iconv -f UTF-8 -t ASCII//TRANSLIT 2>/dev/null || printf '%s' "$1")
+  s=$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g')
+  printf '%s' "${s:-sem-nome}"
+}
+
+titulo() { # <arquivo.md> <fallback> → texto do primeiro "# "
+  local t
+  t=$(grep -m1 '^# ' "$1" 2>/dev/null | sed 's/^# *//')
+  printf '%s' "${t:-$2}"
+}
+
+idade() { # <epoch>
+  local s=$(( $(date +%s) - $1 ))
+  if (( s < 3600 )); then printf 'agora há pouco'
+  elif (( s < 86400 )); then printf 'há %d h' $(( s / 3600 ))
+  else printf 'há %d d' $(( s / 86400 )); fi
+}
+
+nascimento() { # <pasta> → epoch estável (criação de .tarefa); não muda ao salvar
+  local w
+  w=$(stat -c %W "$1/.tarefa" 2>/dev/null || echo 0)
+  if [[ -z $w || $w == 0 ]]; then stat -c %Y "$1"; else printf '%s' "$w"; fi
+}
+
+atividade() { # <pasta> → o mais recente entre abrir a CLI e gravar o TAREFA.md
+  local a=0 b=0 m
+  a=$(stat -c %Y "$1/.tarefa/ultima-cli" 2>/dev/null || echo 0)
+  b=$(stat -c %Y "$1/TAREFA.md" 2>/dev/null || echo 0)
+  if (( a > b )); then m=$a; else m=$b; fi
+  if (( m == 0 )); then stat -c %Y "$1"; else printf '%s' "$m"; fi
+}
+
+ultimo_historico() { # <TAREFA.md> → última entrada do Histórico
+  awk '/^## Histórico/ {p=1; next} p && /^- / {line=$0} END {print line}' "$1"
+}
+
+resumo_estado() { # <TAREFA.md> → linha Último, senão a primeira do Estado atual
+  awk '
+    /^## Estado atual/ {p=1; next}
+    /^## / && p {exit}
+    p && /^\*\*Último:\*\*/ {sub(/^\*\*Último:\*\* /,""); u=$0; exit}
+    p && NF && fb=="" {fb=$0}
+    END {if (u != "") print u; else if (fb != "") print fb}
+  ' "$1"
+}
+
+atalhos() { # <pasta> <arquivo-alvo>: CLAUDE.md/AGENTS.md/GEMINI.md → alvo
+  local f
+  for f in CLAUDE.md AGENTS.md GEMINI.md; do
+    [[ -e "$1/$f" || -L "$1/$f" ]] || ln -s "$2" "$1/$f"
+  done
+}
+
+novo_projeto() { # <nome> → imprime a pasta
+  local nome=$1 dir
+  dir="$ROOT/$(slug "$nome")"
+  [[ -e $dir ]] && { echo "já existe: $dir" >&2; return 1; }
+  mkdir -p "$dir"
+  cat >"$dir/PROJETO.md" <<EOF
+# $nome
+
+Contexto geral deste projeto. Vale para todas as tarefas (subpastas) e para qualquer CLI.
+
+## O que é
+(descreva em 2–3 linhas)
+
+## Regras e cuidados permanentes
+(o que todo agente precisa saber antes de mexer em qualquer coisa deste projeto)
+EOF
+  atalhos "$dir" PROJETO.md
+  printf '%s\n' "$dir"
+}
+
+nova_tarefa() { # <pasta-do-projeto> <nome> → imprime a pasta
+  local proj=$1 nome=$2 dir
+  [[ -f $proj/PROJETO.md ]] || { echo "não é um projeto: $proj" >&2; return 1; }
+  dir="$proj/$(slug "$nome")"
+  [[ -e $dir ]] && { echo "já existe: $dir" >&2; return 1; }
+  mkdir -p "$dir/.tarefa"
+  cat >"$dir/TAREFA.md" <<EOF
+# $nome
+
+Status: aberta
+Projeto: $(titulo "$proj/PROJETO.md" "${proj##*/}") — contexto geral em \`../PROJETO.md\` (leia, se ainda não estiver no seu contexto).
+
+## Como usar esta pasta (instruções para o agente)
+- Esta pasta é UMA tarefa. Este arquivo é a memória durável dela e vale para qualquer CLI
+  (CLAUDE.md, AGENTS.md e GEMINI.md são atalhos para ele).
+- Ao retomar: leia "Estado atual" antes de agir.
+- Quando o usuário disser "salva", "salva a tarefa" ou "salva o projeto": rode
+  \`tarefas salva "frase do estado atual"\`. Grava nesta pasta (linha **Último** +
+  próximo número no Histórico) e a tarefa sobe na árvore do SUPER+R. Não edite o Histórico à mão.
+- Resolveu? Troque \`Status: aberta\` por \`Status: resolvida\`. Se o problema voltar, reabra.
+- Arquivos de trabalho desta tarefa ficam nesta pasta.
+
+## Estado atual
+(ainda não iniciada)
+
+## Histórico
+- 1. $HOJE — tarefa criada.
+EOF
+  atalhos "$dir" TAREFA.md
+  printf '%s\n' "$dir"
+}
+
+lista() { # linhas "tipo<TAB>pasta<TAB>texto"; tipo: P projeto, T tarefa, N nova tarefa, NP novo projeto
+  local p t nome st cli marca num
+  mkdir -p "$ROOT"
+  while IFS=$'\t' read -r _ p; do
+    nome=$(titulo "$p/PROJETO.md" "${p##*/}")
+    printf 'P\t%s\t\033[1m▸ %s\033[0m\n' "$p" "$nome"
+    unset NUM
+    declare -A NUM=()
+    local i=0
+    while IFS=$'\t' read -r _ t; do
+      i=$((i+1))
+      NUM[$t]=$i
+    done < <(for t in "$p"/*/; do t=${t%/}; [[ -f $t/TAREFA.md ]] && printf '%s\t%s\n' "$(nascimento "$t")" "$t"; done | sort -n)
+    while IFS=$'\t' read -r _ t; do
+      st=$(grep -m1 -i '^Status:' "$t/TAREFA.md" 2>/dev/null | sed 's/^[^:]*: *//')
+      [[ ${st,,} == resolvida* ]] && marca='✓' || marca='●'
+      cli=$(cat "$t/.tarefa/ultima-cli" 2>/dev/null || true)
+      num=$(printf '%2d' "${NUM[$t]:-0}")
+      printf 'T\t%s\t    %s %s. %s  \033[2m%s%s\033[0m\n' "$t" "$marca" "$num" "$(titulo "$t/TAREFA.md" "${t##*/}")" \
+        "${cli:+${ROTULO[$cli]:-$cli} · }" "$(idade "$(atividade "$t")")"
+    done < <(for t in "$p"/*/; do t=${t%/}; [[ -f $t/TAREFA.md ]] && printf '%s\t%s\n' "$(atividade "$t")" "$t"; done | sort -rn)
+    printf 'N\t%s\t    \033[2m＋ nova tarefa em "%s"\033[0m\n' "$p" "$nome"
+  done < <(for p in "$ROOT"/*/; do p=${p%/}; [[ -f $p/PROJETO.md ]] || continue
+             a=$(for t in "$p" "$p"/*/; do [[ -d $t ]] && atividade "${t%/}"; done | sort -rn | head -1)
+             printf '%s\t%s\n' "$a" "$p"; done | sort -rn)
+  printf 'NP\t-\t\033[2m＋ novo projeto\033[0m\n'
+}
+
+indice() { # <pasta-do-projeto> → lista numerada (ordem de criação) para o preview
+  local p=$1 t i=0 nome st marca ult
+  [[ -f $p/PROJETO.md ]] || { echo "não é um projeto: $p" >&2; return 1; }
+  printf '# %s\n\nNúmero = ordem em que a tarefa foi criada. A lista da esquerda segue o uso recente.\n\n' \
+    "$(titulo "$p/PROJETO.md" "${p##*/}")"
+  while IFS=$'\t' read -r _ t; do
+    i=$((i+1))
+    st=$(grep -m1 -i '^Status:' "$t/TAREFA.md" 2>/dev/null | sed 's/^[^:]*: *//')
+    [[ ${st,,} == resolvida* ]] && marca='✓' || marca='●'
+    nome=$(titulo "$t/TAREFA.md" "${t##*/}")
+    ult=$(ultimo_historico "$t/TAREFA.md")
+    printf '%2d. %s %s   \033[2m%s\033[0m\n' "$i" "$marca" "$nome" "$(idade "$(atividade "$t")")"
+    [[ -n $ult ]] && printf '    %s\n' "$ult"
+    echo
+  done < <(for t in "$p"/*/; do t=${t%/}; [[ -f $t/TAREFA.md ]] && printf '%s\t%s\n' "$(nascimento "$t")" "$t"; done | sort -n)
+}
+
+escolhe_cli() { # <pasta> → imprime o id da CLI
+  local dir=$1 ult c r sel opts=() pre=""
+  ult=$(cat "$dir/.tarefa/ultima-cli" 2>/dev/null || echo claude)
+  for c in "${CLIS[@]}"; do
+    command -v "$c" >/dev/null 2>&1 || continue
+    r=${ROTULO[$c]}; [[ -e $dir/.tarefa/$c.usada ]] && r+="  (continuar a conversa)"
+    opts+=("$r"); [[ $c == "$ult" ]] && pre=$r
+  done
+  sel=$(gum choose --header "Abrir com qual CLI?" ${pre:+--selected "$pre"} "${opts[@]}") || return 1
+  sel=${sel%%  (continuar*}
+  for c in "${CLIS[@]}"; do [[ ${ROTULO[$c]} == "$sel" ]] && { printf '%s' "$c"; return 0; }; done
+  return 1
+}
+
+resolve() { # nunca executa wrapper `mise use -g` (pode instalar/atualizar); usa o binário real
+  local p
+  p=$(command -v "$1" 2>/dev/null) || return 1
+  if head -c 600 "$p" 2>/dev/null | grep -q 'mise use -g'; then
+    timeout 10 mise which "$1" 2>/dev/null || printf '%s' "$p"
+  else
+    printf '%s' "$p"
+  fi
+}
+
+roda() { # <pasta> <cli>: roda a CLI na pasta, continuando a conversa se já houve uma
+  local dir=$1 cli=$2 bin ini rc
+  cd "$dir" || exit 1
+  bin=$(resolve "$cli") || { echo "CLI não encontrada: $cli" >&2; exit 1; }
+  mkdir -p .tarefa; printf '%s\n' "$cli" >.tarefa/ultima-cli
+  if [[ -e .tarefa/$cli.usada ]]; then
+    ini=$SECONDS
+    # shellcheck disable=SC2086
+    "$bin" ${CONTINUA[$cli]}; rc=$?
+    # falhou em menos de 5 s = não havia conversa para continuar → começa uma nova
+    (( rc != 0 && SECONDS - ini < 5 )) && exec "$bin"
+    exit $rc
+  fi
+  touch ".tarefa/$cli.usada"
+  exec "$bin"
+}
+
+abre() { # <pasta> <cli> <janela 0/1>
+  if [[ $3 == 1 ]]; then
+    setsid uwsm-app -- xdg-terminal-exec --app-id="org.omarchy.$2" --dir="$1" -e "$SELF" _roda "$1" "$2" >/dev/null 2>&1 &
+    disown; sleep 0.3
+  else
+    roda "$1" "$2"
+  fi
+}
+
+seletor() { # <janela 0/1>
+  local janela=$1 linha tipo dir nome cli
+  # shellcheck disable=SC1091
+  command -v omarchy-restart-gum >/dev/null 2>&1 && source omarchy-restart-gum 2>/dev/null || true
+  while true; do
+    linha=$(lista | fzf --ansi --delimiter=$'\t' --with-nth=3 --no-sort --layout=reverse --cycle \
+      --prompt='retomar › ' --header='Enter abre · Esc sai · ● aberta  ✓ resolvida' \
+      --preview='f={2}; if [ -f "$f/TAREFA.md" ]; then cat "$f/TAREFA.md"; elif [ -f "$f/PROJETO.md" ]; then "'"$SELF"'" indice "$f"; else echo "Cria um projeto novo (uma pasta em '"$ROOT"')."; fi | fold -s -w "$FZF_PREVIEW_COLUMNS"' \
+      --preview-window='right,55%') || return 0
+    IFS=$'\t' read -r tipo dir _ <<<"$linha"
+    case $tipo in
+      NP) nome=$(gum input --header "Nome do novo projeto" --placeholder "ex.: Mac Studio") || continue
+          [[ -n $nome ]] && novo_projeto "$nome" >/dev/null; continue ;;
+      N)  nome=$(gum input --header "Nome da nova tarefa" --placeholder "ex.: Conserto do mouse") || continue
+          [[ -n $nome ]] || continue
+          dir=$(nova_tarefa "$dir" "$nome") || { sleep 2; continue; } ;;
+    esac
+    cli=$(escolhe_cli "$dir") || continue
+    abre "$dir" "$cli" "$janela"; return 0
+  done
+}
+
+md_grava() { # <salva|numerar> <TAREFA.md> [frase]
+  python3 - "$1" "$2" "${3:-}" <<'PY'
+import os, re, sys, datetime
+mode, path, texto = sys.argv[1], sys.argv[2], sys.argv[3].strip()
+texto = re.sub(r"\s+", " ", texto)
+raw = open(path, encoding="utf-8").read()
+if not raw.endswith("\n"):
+    raw += "\n"
+
+def split_hist(body):
+    bullets, cur = [], None
+    for line in body.splitlines():
+        if line.startswith("- "):
+            if cur is not None:
+                bullets.append(cur)
+            cur = [line]
+        elif cur is not None and (line.startswith(" ") or line.startswith("\t")):
+            cur.append(line)
+        else:
+            if cur is not None:
+                bullets.append(cur)
+                cur = None
+    if cur is not None:
+        bullets.append(cur)
+    return bullets
+
+def parse(first):
+    m = re.match(r"^- (\d+)\. (.*)$", first)
+    if m:
+        return int(m.group(1)), m.group(2)
+    return None, first[2:]
+
+hm = re.search(r"(## Histórico\n)(.*)\Z", raw, re.S)
+if not hm:
+    sys.exit("sem seção Histórico em " + path)
+bullets = []
+for b in split_hist(hm.group(2)):
+    n, rest = parse(b[0])
+    bullets.append([n, rest, b[1:]])
+used = {n for n, _, _ in bullets if n}
+nxt = 1
+for b in bullets:
+    if b[0] is None:
+        while nxt in used:
+            nxt += 1
+        b[0] = nxt
+        used.add(nxt)
+        nxt += 1
+
+if mode == "salva":
+    if not texto:
+        sys.exit('uso: tarefas salva "frase do estado atual"')
+    em = re.search(r"(## Estado atual\n)(.*?)(\n## )", raw, re.S)
+    if not em:
+        sys.exit("sem seção Estado atual em " + path)
+    body = em.group(2)
+    lines = body.splitlines()
+    nonempty = [ln.strip() for ln in lines if ln.strip()]
+    if nonempty in ([], ["(ainda não iniciada)"]):
+        new_body = texto + "\n"
+    else:
+        out, replaced = [], False
+        for ln in lines:
+            if ln.startswith("**Último:**"):
+                if not replaced:
+                    out.append("**Último:** " + texto)
+                    replaced = True
+                continue
+            out.append(ln)
+        if not replaced:
+            out = ["**Último:** " + texto, ""] + out
+        new_body = "\n".join(out).rstrip() + "\n"
+    raw = raw[:em.start(2)] + new_body + raw[em.start(3):]
+    hm = re.search(r"(## Histórico\n)(.*)\Z", raw, re.S)
+    msg = datetime.date.today().isoformat() + " — " + texto
+    last = bullets[-1][1] if bullets else ""
+    if not last.endswith("— " + texto):
+        nnew = max(used or {0}) + 1
+        bullets.append([nnew, msg, []])
+
+parts = []
+for n, rest, cont in bullets:
+    parts.append(f"- {n}. {rest}")
+    parts.extend(cont)
+new_hist = "\n".join(parts) + "\n"
+hm = re.search(r"(## Histórico\n)(.*)\Z", raw, re.S)
+raw = raw[:hm.start(2)] + new_hist
+st = os.stat(path)
+open(path, "w", encoding="utf-8").write(raw)
+if mode == "numerar":
+    os.utime(path, (st.st_atime, st.st_mtime))
+    print(path)
+else:
+    n, rest, _ = bullets[-1]
+    print(f"{n}. {rest}")
+PY
+}
+
+salva() { # [pasta] "frase…"
+  local dir
+  if [[ -f ${1:-}/TAREFA.md ]]; then dir=$1; shift
+  elif [[ -f ./TAREFA.md ]]; then dir=.
+  else echo "não estou numa pasta de tarefa (falta TAREFA.md)" >&2; return 1
+  fi
+  [[ -n ${*:-} ]] || { echo 'uso: tarefas salva "frase do estado atual"' >&2; return 1; }
+  md_grava salva "$dir/TAREFA.md" "$*"
+}
+
+numerar() {
+  local f n=0
+  while IFS= read -r f; do
+    md_grava numerar "$f" && n=$((n+1))
+  done < <(find "$ROOT" -name TAREFA.md -print | sort)
+  echo "numeradas: $n"
+}
+
+case ${1:-} in
+  ""|--janela)  seletor "$([[ ${1:-} == --janela ]] && echo 1 || echo 0)" ;;
+  novo-projeto) novo_projeto "${2:?nome do projeto}" ;;
+  nova-tarefa)  nova_tarefa "${2:?pasta do projeto}" "${3:?nome da tarefa}" ;;
+  salva)        shift; salva "$@" ;;
+  numerar)      numerar ;;
+  indice)       indice "${2:?pasta do projeto}" ;;
+  lista)        lista | cut -f3 | sed 's/\x1b\[[0-9;]*m//g' ;;
+  _roda)        roda "${2:?}" "${3:?}" ;;
+  *) sed -n '2,19p' "$SELF"; exit 2 ;;
+esac

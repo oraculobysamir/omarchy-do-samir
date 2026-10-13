@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Name=Discord Conta 3
+Comment=Terceira conta do Discord (Firefox, perfil isolado)
+Exec=/usr/bin/firefox --new-instance -P discord-public --new-window https://discord.com/channels/@me
+Terminal=false
+Type=Application
+Icon=discord
+StartupNotify=true
+StartupWMClass=firefox
+Categories=Chat;Network;
+Keywords=discord;conta3;firefox;

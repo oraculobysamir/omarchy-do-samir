@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Voxtype transcription log — history you can actually copy.
+#
+# Usage:
+#   voxtype-log              # history (last 7 days), then live follow
+#   voxtype-log copy         # copy the most recent dictation to clipboard
+#   voxtype-log copy 5       # copy the last 5 dictations
+#   voxtype-log dump         # print history only (no follow) — easy to select
+#   voxtype-log 3 days ago   # history since then + follow
+set -euo pipefail
+
+extract_transcripts() {
+  local since="${1:-7 days ago}"
+  journalctl --user -u voxtype.service --since "$since" -o short-iso --no-pager 2>/dev/null \
+    | awk '
+      /Recording stopped/ {
+        if (match($0, /\(([0-9.]+s)\)/, m)) dur=m[1]
+      }
+      /INFO Transcribed:/ {
+        ts=substr($0,1,19)
+        sub(/.*INFO Transcribed: "/, "")
+        sub(/"$/, "")
+        printf "\n[%s]", ts
+        if (dur != "") { printf " (%s)", dur; dur="" }
+        printf "\n%s\n", $0
+      }
+    '
+}
+
+last_n_texts() {
+  local n="${1:-1}"
+  # Use -n (not --since): large journals make --since hang for a long time.
+  journalctl --user -u voxtype.service -n 800 -o cat --no-pager 2>/dev/null \
+    | awk -v n="$n" '
+      /Transcribed:/ {
+        text=$0
+        sub(/.*Transcribed: "/, "", text)
+        sub(/"$/, "", text)
+        i = (++count - 1) % n
+        buf[i] = text
+        if (count < n) filled = count; else filled = n
+        last = i
+      }
+      END {
+        if (filled == 0) exit 1
+        start = (count >= n) ? (last + 1) % n : 0
+        for (k = 0; k < filled; k++) {
+          idx = (start + k) % n
+          if (k) print ""
+          print buf[idx]
+        }
+      }
+    '
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  copy|clipboard|cb)
+    n="${2:-1}"
+    if ! texts="$(last_n_texts "$n")"; then
+      echo "Nenhuma transcrição encontrada no journal do Voxtype." >&2
+      exit 1
+    fi
+    printf '%s\n' "$texts" | wl-copy --trim-newline
+    preview="$(printf '%s' "$texts" | tr '\n' ' ' | head -c 120)"
+    echo "Copiado (${n}): ${preview}"
+    if command -v notify-send >/dev/null 2>&1; then
+      notify-send -u low "Voxtype" "Ditado copiado — Super+V ou Ctrl+V para colar"
+    fi
+    ;;
+  dump|print|history)
+    since="${2:-7 days ago}"
+    echo "=== Transcrições Voxtype (desde: $since) ==="
+    echo "Selecione o texto e use Super+C para copiar (Ctrl+C no terminal cancela)."
+    echo
+    extract_transcripts "$since"
+    echo
+    echo "Dica: voxtype-log copy    → copia o último ditado"
+    echo "      voxtype-log copy 3  → copia os 3 últimos"
+    ;;
+  -h|--help|help)
+    sed -n '2,12p' "$0" | sed 's/^# \?//'
+    ;;
+  *)
+    since="${1:-7 days ago}"
+    if [[ $# -ge 2 ]]; then
+      since="$*"
+    fi
+
+    echo "=== Transcrições Voxtype (desde: $since) ==="
+    echo "Copiar selecionado: Super+C   |  Ctrl+C = sair"
+    echo "Atalho rápido: voxtype-log copy  (ou use o item no menu)"
+    echo
+
+    extract_transcripts "$since"
+
+    echo
+    echo "--- ao vivo (cada novo ditado já vai pro clipboard) ---"
+
+    journalctl --user -u voxtype.service -f -o cat --no-pager 2>/dev/null \
+      | while IFS= read -r line; do
+          if [[ "$line" == *"Transcribed:"* ]]; then
+            text="${line#*Transcribed: }"
+            text="${text#\"}"
+            text="${text%\"}"
+            printf '\n[%s]\n%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$text"
+            printf '%s' "$text" | wl-copy 2>/dev/null || true
+          fi
+        done
+    ;;
+esac

@@ -1,0 +1,860 @@
+#!/usr/bin/env python3
+"""mosaico — launcher de apps em grade (estilo iPad) para toque e controle.
+
+Tela cheia, ícones grandes, sem depender de teclado físico. Os apps vêm de
+duas fontes: o catálogo do `iniciar` (~/.config/iniciar/apps.conf) e os
+arquivos .desktop de /usr/share/applications e ~/.local/share/applications.
+A grade (ordem + itens) persiste em ~/.config/mosaico/apps.json; na primeira
+execução ela é semeada com os favoritos (favorito=1) do apps.conf.
+
+Uso: mosaico [--dump]      (MOSAICO_START=edit|add abre já no modo edição / na lista)
+
+  toque / Enter (A)      abre o app e fecha o Mosaico
+  toque longo / Editar   modo edição: × remove; tocar um ícone o "pega",
+                         tocar outro lugar o solta ali; Backspace remove
+  Esc (B)                fecha (ou sai do modo edição / da lista de adicionar)
+  chamada repetida       fecha a instância aberta (toggle)
+"""
+
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+gi.require_version("Gdk", "4.0")
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
+
+try:  # GLib ≥ 2.80 moveu DesktopAppInfo para GioUnix
+    gi.require_version("GioUnix", "2.0")
+    from gi.repository import GioUnix  # noqa: E402
+    DesktopAppInfo = GioUnix.DesktopAppInfo
+except (ValueError, ImportError, AttributeError):
+    DesktopAppInfo = Gio.DesktopAppInfo
+
+APP_ID = "org.omarchy.mosaico"
+HOME = Path.home()
+XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
+CFG_DIR = XDG_CONFIG / "mosaico"
+APPS_JSON = CFG_DIR / "apps.json"
+INICIAR_CONF = Path(os.environ.get("INICIAR_CONFIG_DIR", XDG_CONFIG / "iniciar")) / "apps.conf"
+WORK_DIR = Path(os.environ.get("INICIAR_WORK_DIR", HOME / "Work"))
+DESKTOP_DIRS = [
+    Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share")) / "applications",
+    Path("/usr/local/share/applications"),
+    Path("/usr/share/applications"),
+]
+
+# Paleta escura
+BG = "#070B12"
+ACCENT = "#00FFE7"
+FG = "#E8F4FF"
+
+COLUMNS = 5
+ICON_PX = 96
+
+CSS = f"""
+window.mosaico {{ background: {BG}; color: {FG}; }}
+.mosaico headerbar, .mosaico .top {{ background: {BG}; color: {FG}; box-shadow: none; }}
+.mosaico .title {{ font-weight: 700; font-size: 17px; letter-spacing: 1px; color: {ACCENT}; }}
+.mosaico .hint {{ color: alpha({FG}, 0.55); font-size: 12px; }}
+.mosaico .topbtn {{
+  min-height: 40px; min-width: 40px; padding: 0 14px; border-radius: 20px;
+  background: alpha({FG}, 0.08); color: {FG}; font-weight: 600; font-size: 14px;
+  border: 1px solid alpha({FG}, 0.10);
+}}
+.mosaico .topbtn:hover, .mosaico .topbtn:focus {{ background: alpha({ACCENT}, 0.18); outline: 2px solid {ACCENT}; outline-offset: 1px; }}
+.mosaico .topbtn.accent {{ background: {ACCENT}; color: {BG}; }}
+.mosaico .topbtn.accent:hover, .mosaico .topbtn.accent:focus {{ background: {ACCENT}; }}
+.mosaico flowbox {{ background: transparent; padding: 6px; }}
+.mosaico flowboxchild {{
+  padding: 8px 4px 6px 4px; border-radius: 18px; outline: 0 solid transparent;
+  transition: outline-width 80ms ease, background 80ms ease;
+}}
+.mosaico flowboxchild:focus, .mosaico flowboxchild:focus-visible {{
+  outline: 3px solid {ACCENT}; outline-offset: -2px; background: alpha({ACCENT}, 0.10);
+}}
+.mosaico flowboxchild:active {{ background: alpha({ACCENT}, 0.18); }}
+.mosaico flowboxchild.grabbed {{ background: alpha({ACCENT}, 0.25); outline: 3px dashed {ACCENT}; outline-offset: -2px; }}
+.mosaico .tile-label {{ color: {FG}; font-size: 12px; font-weight: 500; }}
+.mosaico .monogram {{
+  border-radius: 9999px; color: {FG}; font-size: 34px; font-weight: 700; letter-spacing: -1px;
+  min-width: {ICON_PX}px; min-height: {ICON_PX}px;
+}}
+.mosaico .monogram-small {{ font-size: 15px; min-width: 40px; min-height: 40px; }}
+.mosaico .app-icon {{ border-radius: 22px; }}
+.mosaico .mono-0 {{ background: #0E5A66; }}
+.mosaico .mono-1 {{ background: #1B3F7A; }}
+.mosaico .mono-2 {{ background: #4A2C7A; }}
+.mosaico .mono-3 {{ background: #7A2C5C; }}
+.mosaico .mono-4 {{ background: #7A4A1B; }}
+.mosaico .mono-5 {{ background: #1F6B3B; }}
+.mosaico .mono-6 {{ background: #2E4C6B; }}
+.mosaico .mono-7 {{ background: #5C3B7A; }}
+.mosaico .remove {{
+  min-width: 30px; min-height: 30px; padding: 0; border-radius: 15px;
+  background: #ff4d6d; color: white; font-weight: 700; font-size: 16px; border: 2px solid {BG};
+}}
+.mosaico .remove:focus {{ outline: 2px solid {ACCENT}; }}
+.mosaico .editing-hint {{ color: {ACCENT}; font-size: 12px; }}
+.mosaico entry {{
+  min-height: 44px; border-radius: 22px; font-size: 15px;
+  background: alpha({FG}, 0.08); color: {FG}; border: 1px solid alpha({FG}, 0.15);
+}}
+.mosaico entry:focus-within {{ outline: 2px solid {ACCENT}; outline-offset: 0; }}
+.mosaico list {{ background: transparent; }}
+.mosaico row {{ padding: 5px 12px; border-radius: 14px; min-height: 48px; }}
+.mosaico row:focus, .mosaico row:focus-visible {{ outline: 3px solid {ACCENT}; outline-offset: -2px; background: alpha({ACCENT}, 0.10); }}
+.mosaico row:hover {{ background: alpha({FG}, 0.06); }}
+.mosaico .row-title {{ color: {FG}; font-size: 15px; font-weight: 600; }}
+.mosaico .row-sub {{ color: alpha({FG}, 0.55); font-size: 11px; }}
+.mosaico .row-title.dim, .mosaico .row-sub.dim {{ color: alpha({FG}, 0.35); }}
+.mosaico scrollbar {{ background: transparent; }}
+.mosaico scrollbar slider {{ background: alpha({FG}, 0.25); min-width: 6px; border-radius: 3px; }}
+.mosaico toast {{ background: alpha({ACCENT}, 0.9); color: {BG}; font-weight: 600; }}
+"""
+
+MONO_COLORS = ["#0E5A66", "#1B3F7A", "#4A2C7A", "#7A2C5C", "#7A4A1B", "#1F6B3B", "#2E4C6B", "#5C3B7A"]
+
+
+# ----------------------------------------------------------------- utilitários
+
+def shq(s: str) -> str:
+    """Igual ao shq do iniciar: aspas simples para sh."""
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def is_mise_wrapper(path: str) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            return b"mise use -g" in fh.read()
+    except OSError:
+        return False
+
+
+def notify(title: str, body: str = "") -> None:
+    if shutil.which("omarchy-notification-send"):
+        subprocess.Popen(["omarchy-notification-send", "-u", "low", title, body],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        print(f"mosaico: {title}: {body}", file=sys.stderr)
+
+
+def initial_of(label: str) -> str:
+    """Iniciais das duas primeiras palavras ("Google Calendar" → "GC", "Gmail" → "G")."""
+    words = [w for w in re.split(r"[\s\-_/]+", label) if w and w[0].isalnum()]
+    words = [w for w in words if w.lower() not in ("de", "do", "da", "e", "the", "of")] or words
+    ini = "".join(w[0] for w in words[:2]).upper()
+    return ini or "•"
+
+
+def norm_url(u: str) -> str:
+    return u.strip().strip('"').strip("'").rstrip("/").lower()
+
+
+# ----------------------------------------------------------------- fontes
+
+class Entry:
+    """Um app que pode estar na grade. kind: 'iniciar' ou 'desktop'."""
+
+    def __init__(self, key, label, source, icon=None, sub=""):
+        self.key = key          # identificador estável usado em apps.json
+        self.label = label
+        self.source = source    # "iniciar" | "desktop"
+        self.icon = icon        # nome de ícone ou caminho absoluto (ou None)
+        self.icons = [icon] if icon else []   # candidatos, em ordem de preferência
+        self.sub = sub          # texto secundário na lista de adicionar
+        self.kind = None        # iniciar: webapp/tui/term/app/raw
+        self.arg = None
+        self.iniciar_id = None
+        self.desktop_path = None
+        self.exec = ""
+
+    def launch(self):
+        if self.source == "desktop":
+            return launch_desktop(self.desktop_path)
+        return launch_iniciar(self)
+
+
+def load_iniciar():
+    """Replica o parse de load_catalog do iniciar (sem validar regex)."""
+    entries, favorites, chrome_profile = [], [], "Profile 1"
+    if not INICIAR_CONF.is_file():
+        return entries, favorites, chrome_profile
+    seen = set()
+    for raw in INICIAR_CONF.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.rstrip("\r")
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line.startswith("@chrome_profile="):
+            chrome_profile = line[len("@chrome_profile="):].strip()
+            continue
+        f = line.split("|")
+        if len(f) != 8:
+            continue
+        id_, mesa, cat, label, cmd, rclass, rtitle, fav = [x.strip() for x in f]
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", id_) or id_ in seen:
+            continue
+        if not label or fav not in ("0", "1"):
+            continue
+        kind, sep, arg = cmd.partition(":")
+        if kind not in ("webapp", "tui", "term", "app", "raw") or not arg:
+            continue
+        seen.add(id_)
+        e = Entry(f"iniciar:{id_}", label, "iniciar", sub=f"iniciar · {cat}" if cat else "iniciar")
+        e.kind, e.arg, e.iniciar_id = kind, arg, id_
+        e.chrome_profile = chrome_profile  # @chrome_profile vale para as linhas seguintes
+        entries.append(e)
+        if fav == "1":
+            favorites.append(e.key)
+    return entries, favorites, chrome_profile
+
+
+def load_desktops():
+    entries, seen_ids = [], set()
+    for d in DESKTOP_DIRS:
+        if not d.is_dir():
+            continue
+        for p in sorted(d.glob("*.desktop")):
+            if p.name in seen_ids:
+                continue  # XDG: o primeiro diretório com o id vence
+            try:
+                info = DesktopAppInfo.new_from_filename(str(p))
+            except TypeError:  # construtor devolve NULL: inválido ou Hidden=true
+                info = None
+            if info is None or info.get_nodisplay():
+                continue
+            name = info.get_name()
+            icon = info.get_string("Icon")
+            exe = info.get_commandline() or ""
+            comment = info.get_description() or ""
+            seen_ids.add(p.name)
+            e = Entry(f"desktop:{p.name}", name or p.stem, "desktop", icon=icon,
+                      sub=comment or ("webapp" if "omarchy-launch-webapp" in exe else str(d)))
+            e.desktop_path = str(p)
+            e.exec = exe
+            entries.append(e)
+    return entries
+
+
+def resolve_icons(iniciar_entries, desktop_entries):
+    """Ícone dedicado (<id>.png em ~/.local/share/icons/hicolor/256x256/apps) primeiro;
+    senão herda do .desktop correspondente (webapp pela URL, app pelo binário). (Fable 22/09/2026)"""
+    by_url, by_bin = {}, {}
+    for d in desktop_entries:
+        ex = d.exec or ""
+        m = re.search(r"omarchy-launch-webapp\s+(\S+)", ex)
+        if m:
+            by_url.setdefault(norm_url(m.group(1)), d.icon)
+        first = ex.split()[0] if ex.split() else ""
+        if first:
+            by_bin.setdefault(os.path.basename(first), d.icon)
+    for e in iniciar_entries:
+        cands = []
+        if e.kind == "webapp":
+            host = re.sub(r"^[a-z]+://", "", e.arg).split("/")[0].split(":")[0].lower()
+            parts = [x for x in host.split(".") if x not in ("www", "web", "app", "mail")]
+            sld = parts[-2] if len(parts) >= 2 else (parts[0] if parts else "")
+            cands += [e.iniciar_id, by_url.get(norm_url(e.arg)), sld, f"omarchy-{sld}"]
+        else:
+            b = os.path.basename(e.arg.split()[0])
+            cands += [e.iniciar_id, by_bin.get(b), b]
+        e.icons = [c for c in cands if c]
+        e.icon = e.icons[0] if e.icons else None
+
+
+# ----------------------------------------------------------------- lançamento
+
+CHROME_PROFILE = "Profile 1"
+
+
+def iniciar_launch_string(e: Entry):
+    """Idêntico ao resolve_entry do iniciar. Retorna (comando_sh, motivo_indisponivel)."""
+    arg = e.arg
+    bin_ = arg.split(" ", 1)[0]
+    rest = " " + arg.split(" ", 1)[1] if " " in arg else ""
+    if e.kind == "webapp":
+        why = None if shutil.which("omarchy-launch-webapp") else "omarchy-launch-webapp ausente"
+        profile = getattr(e, "chrome_profile", None) or CHROME_PROFILE
+        return f"omarchy-launch-webapp {shq(arg)} --profile-directory={shq(profile)}", why
+    if e.kind == "tui":
+        path = shutil.which(bin_)
+        real = ""
+        if path and not is_mise_wrapper(path):
+            real = path
+        else:
+            # Nunca executa um wrapper `mise use -g`: ele pode instalar software.
+            try:
+                real = subprocess.run(["mise", "which", bin_], capture_output=True, text=True,
+                                      timeout=10).stdout.strip()
+            except (OSError, subprocess.TimeoutExpired):
+                real = ""
+        why = None if (real and os.access(real, os.X_OK)) else "não instalado"
+        return (f"uwsm-app -- xdg-terminal-exec --app-id=org.omarchy.{e.iniciar_id} "
+                f"--dir={shq(str(WORK_DIR))} -e {shq(real)}{rest}"), why
+    if e.kind == "term":
+        why = None if shutil.which(bin_) else f"{bin_} ausente"
+        return (f"uwsm-app -- xdg-terminal-exec --app-id=org.omarchy.{e.iniciar_id} "
+                f"--dir={shq(str(WORK_DIR))} -e {arg}"), why
+    if e.kind == "app":
+        path = shutil.which(bin_)
+        why = None
+        if not path:
+            why = "não instalado"
+        elif is_mise_wrapper(path):
+            why = "wrapper mise instalaria software"
+        return f"uwsm-app -- {arg}", why
+    why = None if shutil.which(bin_) else f"{bin_} ausente"
+    return arg, why
+
+
+def launch_iniciar(e: Entry) -> bool:
+    cmd, why = iniciar_launch_string(e)
+    if why:
+        notify(f"{e.label}: indisponível", why)
+        return False
+    try:
+        subprocess.Popen(cmd, shell=True, start_new_session=True, cwd=str(HOME),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except OSError as exc:
+        notify(f"{e.label}: falhou", str(exc))
+        return False
+
+
+def launch_desktop(path: str) -> bool:
+    try:
+        info = DesktopAppInfo.new_from_filename(path)
+    except TypeError:
+        info = None
+    if info is None:
+        notify("Mosaico", f"não consegui ler {path}")
+        return False
+    try:
+        display = Gdk.Display.get_default()
+        ctx = display.get_app_launch_context() if display is not None else None
+        return bool(info.launch([], ctx))
+    except GLib.Error as exc:
+        notify(f"{info.get_name()}: falhou", exc.message)
+        return False
+
+
+# ----------------------------------------------------------------- persistência
+
+def load_grid(favorites):
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    if APPS_JSON.is_file():
+        try:
+            data = json.loads(APPS_JSON.read_text(encoding="utf-8"))
+            items = [i["key"] for i in data.get("items", []) if isinstance(i, dict) and "key" in i]
+            return items
+        except (ValueError, OSError) as exc:
+            notify("Mosaico: apps.json inválido", f"{exc}; usando favoritos")
+    save_grid(list(favorites))
+    return list(favorites)
+
+
+def save_grid(keys):
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    data = {"version": 1, "items": [{"key": k} for k in keys]}
+    tmp = APPS_JSON.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, APPS_JSON)
+
+
+# ----------------------------------------------------------------- widgets
+
+def make_icon(entry: Entry, size: int, theme: Gtk.IconTheme) -> Gtk.Widget:
+    for icon in (entry.icons or ([entry.icon] if entry.icon else [])):
+        if icon.startswith("/") and os.path.isfile(icon):
+            img = Gtk.Image.new_from_gicon(Gio.FileIcon.new(Gio.File.new_for_path(icon)))
+            img.set_pixel_size(size)
+            img.add_css_class("app-icon")
+            return img
+        name = re.sub(r"\.(png|svg|xpm)$", "", icon) if "/" not in icon else None
+        if name and theme.has_icon(name):
+            img = Gtk.Image.new_from_icon_name(name)
+            img.set_pixel_size(size)
+            img.add_css_class("app-icon")
+            return img
+    # fallback: inicial do rótulo em um círculo colorido
+    color = MONO_COLORS[int(hashlib.md5(entry.label.encode()).hexdigest(), 16) % len(MONO_COLORS)]
+    lbl = Gtk.Label(label=initial_of(entry.label))
+    lbl.add_css_class("monogram")
+    lbl.set_size_request(size, size)
+    lbl.set_halign(Gtk.Align.CENTER)
+    lbl.set_valign(Gtk.Align.CENTER)
+    lbl.add_css_class(f"mono-{MONO_COLORS.index(color)}")
+    if size < ICON_PX:
+        lbl.add_css_class("monogram-small")
+    return lbl
+
+
+class Tile(Gtk.FlowBoxChild):
+    def __init__(self, entry: Entry, theme: Gtk.IconTheme, on_remove):
+        super().__init__()
+        self.entry = entry
+        self.set_focusable(True)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_halign(Gtk.Align.CENTER)
+        overlay = Gtk.Overlay()
+        overlay.set_child(make_icon(entry, ICON_PX, theme))
+        self.remove_btn = Gtk.Button(label="×")
+        self.remove_btn.add_css_class("remove")
+        self.remove_btn.set_halign(Gtk.Align.START)
+        self.remove_btn.set_valign(Gtk.Align.START)
+        self.remove_btn.set_can_focus(False)
+        self.remove_btn.set_visible(False)
+        self.remove_btn.connect("clicked", lambda *_: on_remove(self))
+        overlay.add_overlay(self.remove_btn)
+        box.append(overlay)
+        lbl = Gtk.Label(label=entry.label)
+        lbl.add_css_class("tile-label")
+        lbl.set_justify(Gtk.Justification.CENTER)
+        lbl.set_wrap(True)
+        lbl.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        lbl.set_lines(2)
+        lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        lbl.set_max_width_chars(13)
+        box.append(lbl)
+        self.set_child(box)
+
+    def set_editing(self, editing: bool):
+        self.remove_btn.set_visible(editing)
+
+
+class AddRow(Gtk.ListBoxRow):
+    def __init__(self, entry: Entry, theme: Gtk.IconTheme, already: bool):
+        super().__init__()
+        self.entry = entry
+        self.already = already
+        self.set_activatable(not already)
+        h = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        h.append(make_icon(entry, 40, theme))
+        v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        v.set_valign(Gtk.Align.CENTER)
+        v.set_hexpand(True)
+        t = Gtk.Label(label=entry.label, xalign=0)
+        t.add_css_class("row-title")
+        t.set_ellipsize(Pango.EllipsizeMode.END)
+        s = Gtk.Label(label=("já no Mosaico · " if already else "") + entry.sub, xalign=0)
+        s.add_css_class("row-sub")
+        s.set_ellipsize(Pango.EllipsizeMode.END)
+        if already:
+            t.add_css_class("dim")
+            s.add_css_class("dim")
+        v.append(t)
+        v.append(s)
+        h.append(v)
+        if already:
+            chk = Gtk.Image.new_from_icon_name("object-select-symbolic")
+            chk.set_pixel_size(20)
+            h.append(chk)
+        self.set_child(h)
+        self.search_text = f"{entry.label} {entry.sub} {entry.key}".lower()
+
+
+class MosaicoWindow(Adw.ApplicationWindow):
+    def __init__(self, app, catalog, grid_keys):
+        super().__init__(application=app, title="Mosaico")
+        self.catalog = catalog              # key -> Entry
+        self.grid_keys = grid_keys          # lista ordenada de keys
+        self.editing = False
+        self.grabbed = None                 # Tile "pego" no modo edição
+        self.add_css_class("mosaico")
+        self.set_default_size(640, 400)
+        self.theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        self.stack.set_transition_duration(150)
+        self.toasts = Adw.ToastOverlay()
+        self.toasts.set_child(self.stack)
+        self.set_content(self.toasts)
+
+        self.stack.add_named(self._build_grid_page(), "grid")
+        self.stack.add_named(self._build_add_page(), "add")
+
+        keys = Gtk.EventControllerKey()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self._on_key)
+        self.add_controller(keys)
+
+        self.connect("map", lambda *_: GLib.idle_add(self._focus_first))
+        self.set_decorated(False)
+        self.fullscreen()
+        start = os.environ.get("MOSAICO_START", "")
+        if start == "edit":
+            self.set_editing(True)
+        elif start == "add":
+            GLib.idle_add(self.show_add)
+
+    # ---- página da grade
+    def _build_grid_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        top.add_css_class("top")
+        top.set_margin_top(8)
+        top.set_margin_bottom(4)
+        top.set_margin_start(16)
+        top.set_margin_end(12)
+        title = Gtk.Label(label="MOSAICO")
+        title.add_css_class("title")
+        top.append(title)
+        self.hint = Gtk.Label(label="")
+        self.hint.add_css_class("hint")
+        self.hint.set_hexpand(True)
+        self.hint.set_xalign(0)
+        self.hint.set_margin_start(10)
+        self.hint.set_ellipsize(Pango.EllipsizeMode.END)
+        top.append(self.hint)
+
+        self.add_btn = Gtk.Button(label="+")
+        self.add_btn.add_css_class("topbtn")
+        self.add_btn.set_tooltip_text("Adicionar app")
+        self.add_btn.connect("clicked", lambda *_: self.show_add())
+        top.append(self.add_btn)
+        self.edit_btn = Gtk.Button(label="Editar")
+        self.edit_btn.add_css_class("topbtn")
+        self.edit_btn.connect("clicked", lambda *_: self.set_editing(not self.editing))
+        top.append(self.edit_btn)
+        close_btn = Gtk.Button(label="✕")
+        close_btn.add_css_class("topbtn")
+        close_btn.set_tooltip_text("Fechar (B / Esc)")
+        close_btn.connect("clicked", lambda *_: self.close())
+        top.append(close_btn)
+        page.append(top)
+
+        self.flow = Gtk.FlowBox()
+        self.flow.set_valign(Gtk.Align.START)
+        self.flow.set_halign(Gtk.Align.FILL)
+        self.flow.set_homogeneous(True)
+        self.flow.set_min_children_per_line(COLUMNS)
+        self.flow.set_max_children_per_line(COLUMNS)
+        self.flow.set_column_spacing(4)
+        self.flow.set_row_spacing(2)
+        self.flow.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.flow.set_activate_on_single_click(True)
+        self.flow.set_margin_start(10)
+        self.flow.set_margin_end(10)
+        self.flow.set_margin_bottom(8)
+        self.flow.connect("child-activated", self._on_tile_activated)
+
+        lp = Gtk.GestureLongPress()
+        lp.set_touch_only(False)
+        lp.set_delay_factor(1.2)        # gtk-long-press-time (500 ms) × 1.2 = 600 ms
+        lp.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        lp.connect("pressed", self._on_long_press)
+        self.flow.add_controller(lp)
+
+        self.scroller = Gtk.ScrolledWindow()
+        self.scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.scroller.set_vexpand(True)
+        self.scroller.set_child(self.flow)
+        page.append(self.scroller)
+
+        self.empty = Gtk.Label(label="Nenhum app. Toque em + para adicionar.")
+        self.empty.add_css_class("hint")
+        self.empty.set_vexpand(True)
+        self.empty.set_visible(False)
+        page.append(self.empty)
+
+        self._rebuild_tiles()
+        return page
+
+    def _rebuild_tiles(self):
+        while (c := self.flow.get_first_child()) is not None:
+            self.flow.remove(c)
+        missing = []
+        for k in self.grid_keys:
+            e = self.catalog.get(k)
+            if e is None:
+                missing.append(k)
+                continue
+            t = Tile(e, self.theme, self._remove_tile)
+            t.set_editing(self.editing)
+            self.flow.append(t)
+        if missing:
+            # itens que sumiram do apps.conf ou .desktop removido: não persistir
+            self.grid_keys = [k for k in self.grid_keys if k not in missing]
+            save_grid(self.grid_keys)
+        has = bool(self.grid_keys)
+        self.scroller.set_visible(has)
+        self.empty.set_visible(not has)
+        self._update_hint()
+
+    def _tiles(self):
+        c = self.flow.get_first_child()
+        while c is not None:
+            yield c
+            c = c.get_next_sibling()
+
+    def _update_hint(self):
+        if self.editing:
+            if self.grabbed is not None:
+                self.hint.set_text(f"Movendo “{self.grabbed.entry.label}”: toque onde soltar · A solta · B cancela")
+            else:
+                self.hint.set_text("Toque num app para movê-lo · × remove · Backspace remove")
+            self.hint.add_css_class("editing-hint")
+        else:
+            n = len(self.grid_keys)
+            self.hint.set_text(f"{n} app{'s' if n != 1 else ''} · toque longo para editar")
+            self.hint.remove_css_class("editing-hint")
+
+    def _focus_first(self):
+        first = self.flow.get_child_at_index(0)
+        if first is not None:
+            first.grab_focus()
+        return False
+
+    # ---- interação
+    def set_editing(self, editing: bool):
+        self.editing = editing
+        self._set_grabbed(None)
+        for t in self._tiles():
+            t.set_editing(editing)
+        self.edit_btn.set_label("Concluído" if editing else "Editar")
+        if editing:
+            self.edit_btn.add_css_class("accent")
+        else:
+            self.edit_btn.remove_css_class("accent")
+        self._update_hint()
+
+    def _set_grabbed(self, tile):
+        if self.grabbed is not None:
+            self.grabbed.remove_css_class("grabbed")
+        self.grabbed = tile
+        if tile is not None:
+            tile.add_css_class("grabbed")
+        self._update_hint()
+
+    def _on_long_press(self, gesture, x, y):
+        child = self.flow.get_child_at_pos(int(x), int(y))
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        if not self.editing:
+            self.set_editing(True)
+        if child is not None:
+            child.grab_focus()
+
+    def _on_tile_activated(self, flow, child):
+        if not self.editing:
+            self._launch(child.entry)
+            return
+        if self.grabbed is None:
+            self._set_grabbed(child)
+        elif self.grabbed is child:
+            self._set_grabbed(None)
+        else:
+            self._move_tile(self.grabbed, child.get_index())
+            self._set_grabbed(None)
+
+    def _move_tile(self, tile, new_index):
+        old = tile.get_index()
+        if old == new_index:
+            return
+        key = self.grid_keys.pop(old)
+        self.grid_keys.insert(new_index, key)
+        save_grid(self.grid_keys)
+        self.flow.remove(tile)
+        self.flow.insert(tile, new_index)
+        tile.grab_focus()
+
+    def _remove_tile(self, tile):
+        idx = tile.get_index()
+        label = tile.entry.label
+        if self.grabbed is tile:
+            self._set_grabbed(None)
+        self.grid_keys.pop(idx)
+        save_grid(self.grid_keys)
+        self.flow.remove(tile)
+        nxt = self.flow.get_child_at_index(min(idx, len(self.grid_keys) - 1))
+        if nxt is not None:
+            nxt.grab_focus()
+        else:
+            self.scroller.set_visible(False)
+            self.empty.set_visible(True)
+        self._update_hint()
+        self._toast(f"“{label}” removido")
+
+    def _launch(self, entry: Entry):
+        ok = entry.launch()
+        if ok:
+            # dá tempo ao contexto de lançamento antes de encerrar o processo
+            GLib.timeout_add(200, lambda: (self.close(), False)[1])
+
+    def _toast(self, text):
+        t = Adw.Toast.new(text)
+        t.set_timeout(2)
+        self.toasts.add_toast(t)
+
+    def _on_key(self, ctrl, keyval, keycode, state):
+        page = self.stack.get_visible_child_name()
+        if keyval == Gdk.KEY_Escape:
+            if page == "add":
+                self.show_grid()
+            elif self.grabbed is not None:
+                self._set_grabbed(None)
+            elif self.editing:
+                self.set_editing(False)
+            else:
+                self.close()
+            return True
+        if page == "grid" and self.editing and keyval in (Gdk.KEY_BackSpace, Gdk.KEY_Delete):
+            f = self.get_focus()
+            while f is not None and not isinstance(f, Tile):
+                f = f.get_parent()
+            if f is not None:
+                self._remove_tile(f)
+                return True
+        return False
+
+    # ---- página de adicionar
+    def _build_add_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        top.add_css_class("top")
+        top.set_margin_top(8)
+        top.set_margin_start(12)
+        top.set_margin_end(12)
+        back = Gtk.Button(label="‹ Voltar")
+        back.add_css_class("topbtn")
+        back.connect("clicked", lambda *_: self.show_grid())
+        top.append(back)
+        self.search = Gtk.SearchEntry()
+        self.search.set_placeholder_text("Buscar app…")
+        self.search.set_hexpand(True)
+        self.search.connect("search-changed", lambda *_: self.listbox.invalidate_filter())
+        self.search.connect("activate", self._on_search_activate)
+        top.append(self.search)
+        page.append(top)
+
+        self.listbox = Gtk.ListBox()
+        self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.listbox.set_activate_on_single_click(True)
+        self.listbox.set_filter_func(self._filter_row)
+        self.listbox.connect("row-activated", self._on_row_activated)
+        self.listbox.set_margin_start(8)
+        self.listbox.set_margin_end(8)
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw.set_vexpand(True)
+        sw.set_child(self.listbox)
+        page.append(sw)
+        return page
+
+    def _fill_add_list(self):
+        while (c := self.listbox.get_first_child()) is not None:
+            self.listbox.remove(c)
+        present = set(self.grid_keys)
+        ordered = sorted(self.catalog.values(), key=lambda e: (e.key in present, e.source != "iniciar", e.label.lower()))
+        for e in ordered:
+            self.listbox.append(AddRow(e, self.theme, e.key in present))
+
+    def _filter_row(self, row):
+        q = self.search.get_text().strip().lower()
+        if not q:
+            return True
+        return all(w in row.search_text for w in q.split())
+
+    def _on_search_activate(self, *_):
+        r = self.listbox.get_first_child()
+        while r is not None:
+            if r.get_visible() and r.get_child_visible() and not r.already:
+                self._on_row_activated(self.listbox, r)
+                return
+            r = r.get_next_sibling()
+
+    def _on_row_activated(self, lb, row):
+        if row.already:
+            return
+        self.grid_keys.append(row.entry.key)
+        save_grid(self.grid_keys)
+        self._rebuild_tiles()
+        self._toast(f"“{row.entry.label}” adicionado")
+        self.show_grid(focus_last=True)
+
+    def show_add(self):
+        self._set_grabbed(None)
+        self._fill_add_list()
+        self.search.set_text("")
+        self.stack.set_visible_child_name("add")
+        GLib.idle_add(lambda: (self.search.grab_focus(), False)[1])
+
+    def show_grid(self, focus_last=False):
+        self.stack.set_visible_child_name("grid")
+        n = len(self.grid_keys)
+        target = self.flow.get_child_at_index(n - 1 if focus_last and n else 0)
+        if target is not None:
+            target.grab_focus()
+            if focus_last:
+                adj = self.scroller.get_vadjustment()
+                adj.set_value(adj.get_upper() - adj.get_page_size())
+
+
+class MosaicoApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        self.win = None
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        prov = Gtk.CssProvider()
+        prov.load_from_string(CSS)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def do_activate(self):
+        if self.win is not None and self.win.get_visible():
+            # segunda chamada enquanto aberto = fecha (toggle)
+            self.win.close()
+            return
+        catalog, grid_keys = build_catalog()
+        self.win = MosaicoWindow(self, catalog, grid_keys)
+        self.win.connect("close-request", self._on_close)
+        self.win.present()
+
+    def _on_close(self, *_):
+        self.win = None
+        return False
+
+
+def build_catalog():
+    global CHROME_PROFILE
+    iniciar_entries, favorites, CHROME_PROFILE = load_iniciar()
+    desktop_entries = load_desktops()
+    resolve_icons(iniciar_entries, desktop_entries)
+    catalog = {e.key: e for e in iniciar_entries + desktop_entries}
+    grid_keys = load_grid(favorites)
+    return catalog, grid_keys
+
+
+def main(argv):
+    if "--dump" in argv:
+        catalog, grid_keys = build_catalog()
+        print(f"# catálogo: {len(catalog)} entradas · grade: {len(grid_keys)} · {APPS_JSON}")
+        for k in grid_keys:
+            e = catalog.get(k)
+            if e is None:
+                print(f"  {k:32} (ausente)")
+                continue
+            cmd = e.desktop_path if e.source == "desktop" else iniciar_launch_string(e)[0]
+            print(f"  {k:32} icon={e.icon!s:30} {cmd}")
+        return 0
+    if "--help" in argv or "-h" in argv:
+        print(__doc__)
+        return 0
+    app = MosaicoApp()
+    return app.run(None)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

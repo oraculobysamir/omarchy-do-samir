@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "samiriasbeck.downloads",
+  "name": "Recent downloads",
+  "version": "1.0.0",
+  "author": "samiriasbeck",
+  "license": "MIT",
+  "description": "Bar button that lists the last 10 files in Downloads with thumbnails or icons, copy and drag-out.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Downloads",
+    "description": "Last 10 downloads: copy path or drag into another app",
+    "category": "Utilities",
+    "allowMultiple": false,
+    "defaultSection": "center"
+  }
+}

@@ -1,0 +1,1002 @@
+#!/bin/bash
+# iniciar — launcher de sessão do Omarchy.
+#
+# Mostra o catálogo de apps em checkboxes (última seleção ou favoritos já
+# marcados) e abre cada app marcado na sua mesa, sem duplicar o que já está
+# aberto. Veja README.md para requisitos e limites.
+#
+# Uso: iniciar [--mode=mesas|pares|atual] [--last] [--autostart] [--list] [--edit] [--help]
+
+set -euo pipefail
+
+readonly VERSION="1.2.0"
+readonly CFG_DIR="${INICIAR_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/iniciar}"
+readonly APPS_CONF="$CFG_DIR/apps.conf"
+readonly MESAS_CONF="$CFG_DIR/mesas.conf"
+readonly STATE_FILE="$CFG_DIR/state"
+readonly MODE_FILE="$CFG_DIR/mode"
+readonly SESSION_FILE="$CFG_DIR/last-session"
+readonly RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+readonly LOCK_FILE="${INICIAR_LOCK_FILE:-$RUNTIME_DIR/iniciar.lock}"
+readonly LOG_FILE="${INICIAR_LOG_FILE:-${XDG_STATE_HOME:-$HOME/.local/state}/iniciar/last-run.log}"
+readonly WORK_DIR="${INICIAR_WORK_DIR:-$HOME/Work}"
+readonly POLL_TIMEOUT="${INICIAR_POLL_TIMEOUT:-10}"
+readonly SLOW_TIMEOUT="${INICIAR_SLOW_TIMEOUT:-20}"
+readonly AUTOSTART_SECONDS="${INICIAR_AUTOSTART_SECONDS:-15}"
+# Test hooks (documented in the README): keep tests off the user's view.
+readonly NO_FOCUS="${INICIAR_NO_FOCUS:-0}"
+readonly NO_NOTIFY="${INICIAR_NO_NOTIFY:-0}"
+readonly ACTIVE_WS_OVERRIDE="${INICIAR_ACTIVE_WS:-}"
+readonly PARES_START="${INICIAR_PARES_INICIO:-1}"
+readonly IPC_TIMEOUT=3
+# Terminal windows whose child process can reveal which agent/TUI they run.
+readonly TERMINAL_CLASS_RE='^(org\.omarchy\..+|foot|org\.codeberg\.dnkl\.foot|TUI\..+)$'
+
+readonly -a MODE_IDS=(mesas pares atual)
+declare -A MODE_LABEL=(
+  [mesas]="mesas — cada categoria na sua mesa"
+  [pares]="pares — 2 apps por mesa na ordem do catálogo"
+  [atual]="atual — tudo na mesa em que você está"
+  [sessao]="sessão salva — cada app na mesa onde estava"
+)
+
+# ---------------------------------------------------------------- helpers
+
+warn() {
+  WARNINGS+=("$*")
+  printf 'aviso: %s\n' "$*" >&2
+}
+
+die() {
+  local code=$1
+  shift
+  printf 'iniciar: %s\n' "$*" >&2
+  exit "$code"
+}
+
+notify() {
+  [[ $NO_NOTIFY == 1 ]] && return 0
+  omarchy-notification-send -u low "$@" >/dev/null 2>&1 || true
+}
+
+trim() {
+  local s=$1
+  s=${s#"${s%%[![:space:]]*}"}
+  s=${s%"${s##*[![:space:]]}"}
+  printf '%s' "$s"
+}
+
+# Single-quote for sh (Hyprland runs exec_cmd through a shell).
+shq() {
+  local s=${1//\'/\'\\\'\'}
+  printf "'%s'" "$s"
+}
+
+# Lua long-bracket literal: pick a level whose closing bracket cannot occur in
+# the text or at its junction with the closer. printf %q is a bash escape and
+# is NOT valid Lua (review 02/03).
+lua_string() {
+  local s=$1 eq=""
+  while [[ $s == *"]$eq]"* || $s == *"]$eq" ]]; do
+    eq+="="
+  done
+  printf '[%s[%s]%s]' "$eq" "$s" "$eq"
+}
+
+regex_escape() {
+  printf '%s' "$1" | sed 's/[][\.*^$+?(){}|/\\]/\\&/g'
+}
+
+now_ms() {
+  printf '%s' "$(($(date +%s%N) / 1000000))"
+}
+
+hypr_dispatch() {
+  local out
+  out=$(timeout "$IPC_TIMEOUT" hyprctl dispatch "$1" 2>&1) || return 1
+  [[ $out == ok ]]
+}
+
+write_atomic() {
+  local file=$1 content=$2 tmp
+  tmp=$(mktemp "$file.XXXXXX") || return 1
+  if printf '%s' "$content" >"$tmp" && mv -f "$tmp" "$file"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+# ---------------------------------------------------------------- defaults
+
+write_default_apps_conf() {
+  cat >"$APPS_CONF" <<'CONF'
+# id | mesa | categoria | rótulo | comando | regex_class | regex_title | favorito
+# Catálogo de exemplo; use apenas comandos locais confiáveis. Adapte aos apps instalados.
+@chrome_profile=Default
+terminal | 1 | Trabalho | Terminal | term:bash | auto | | 1
+files | 1 | Trabalho | Arquivos | app:nautilus | ^org\.gnome\.Nautilus$ | | 0
+firefox | 2 | Navegação | Firefox | app:firefox | ^firefox$ | | 0
+CONF
+}
+
+write_default_mesas_conf() {
+  cat >"$MESAS_CONF" <<'CONF'
+# Nome e modo de cada mesa: numero | nome | modo
+# modo: tile (lado a lado, segue o layout da mesa). "abas" ainda não é suportado.
+1 | Conversas         | tile
+2 | Google e trabalho | tile
+3 | Mídia e remoto    | tile
+4 | Agentes           | tile
+CONF
+}
+
+ensure_config() {
+  mkdir -p "$CFG_DIR"
+  [[ -f $APPS_CONF ]] || write_default_apps_conf
+  [[ -f $MESAS_CONF ]] || write_default_mesas_conf
+}
+
+# ---------------------------------------------------------------- catalog
+
+declare -a IDS=() WARNINGS=()
+declare -A MESA=() CAT=() LABEL=() KIND=() ARG=() RCLASS=() RTITLE=() FAV=() PROF=()
+declare -A LAUNCH=() AVAIL=() WHY=() MATCH_BIN=() SLOW=() MESA_NAME=() MESA_MODE=()
+CHROME_PROFILE="Profile 1"
+
+load_mesas() {
+  [[ -f $MESAS_CONF ]] || return 0
+  local line num name mode
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ -z ${line//[[:space:]]/} || $line == \#* ]] && continue
+    IFS='|' read -r num name mode <<<"$line"
+    num=$(trim "$num")
+    [[ $num =~ ^[1-9][0-9]*$ ]] || continue
+    MESA_NAME[$num]=$(trim "$name")
+    MESA_MODE[$num]=$(trim "${mode:-tile}")
+    [[ ${MESA_MODE[$num]} == abas ]] && warn "mesa $num: modo \"abas\" ainda não é suportado; usando lado a lado"
+  done <"$MESAS_CONF"
+  return 0
+}
+
+load_catalog() {
+  local line n=0 id mesa cat label cmd rclass rtitle fav
+  local -a f=() errors=() regexes=() regex_ids=()
+  declare -A seen_label=()
+
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    line=${line%$'\r'}
+    [[ -z ${line//[[:space:]]/} || $line == \#* ]] && continue
+    if [[ $line == @chrome_profile=* ]]; then
+      CHROME_PROFILE=$(trim "${line#@chrome_profile=}")
+      continue
+    fi
+
+    IFS='|' read -r -a f <<<"$line"
+    if ((${#f[@]} != 8)); then
+      errors+=("linha $n: esperados 8 campos separados por |, encontrados ${#f[@]}")
+      continue
+    fi
+    id=$(trim "${f[0]}")
+    mesa=$(trim "${f[1]}")
+    cat=$(trim "${f[2]}")
+    label=$(trim "${f[3]}")
+    cmd=$(trim "${f[4]}")
+    rclass=$(trim "${f[5]}")
+    rtitle=$(trim "${f[6]}")
+    fav=$(trim "${f[7]}")
+
+    [[ $id =~ ^[a-z0-9][a-z0-9-]*$ ]] || { errors+=("linha $n: id inválido \"$id\""); continue; }
+    [[ -n ${MESA[$id]+x} ]] && { errors+=("linha $n: id repetido \"$id\""); continue; }
+    [[ $mesa =~ ^[1-9][0-9]*$ ]] || { errors+=("linha $n ($id): mesa precisa ser um número positivo"); continue; }
+    [[ -n $label && $label != *,* && $label != *$'\t'* ]] || { errors+=("linha $n ($id): rótulo vazio ou com vírgula"); continue; }
+    [[ $cat != *,* && $cat != *$'\t'* ]] || { errors+=("linha $n ($id): categoria com vírgula"); continue; }
+    [[ -n ${seen_label[$label]+x} ]] && { errors+=("linha $n ($id): rótulo repetido \"$label\""); continue; }
+    [[ $fav == 0 || $fav == 1 ]] || { errors+=("linha $n ($id): favorito precisa ser 0 ou 1"); continue; }
+    [[ -n $rclass ]] || { errors+=("linha $n ($id): regex_class vazia (use auto ou uma regex)"); continue; }
+
+    case $cmd in
+      webapp:?* | tui:?* | term:?* | app:?* | raw:?*) ;;
+      *) errors+=("linha $n ($id): comando precisa começar com webapp:, tui:, term:, app: ou raw:"); continue ;;
+    esac
+
+    seen_label[$label]=1
+    IDS+=("$id")
+    MESA[$id]=$mesa
+    CAT[$id]=$cat
+    LABEL[$id]=$label
+    KIND[$id]=${cmd%%:*}
+    ARG[$id]=${cmd#*:}
+    RTITLE[$id]=$rtitle
+    FAV[$id]=$fav
+    RCLASS[$id]=$rclass
+    PROF[$id]=$CHROME_PROFILE   # @chrome_profile vale para as linhas seguintes
+
+    if [[ $rclass == auto ]]; then
+      case ${KIND[$id]} in
+        webapp) RCLASS[$id]=$(webapp_class_regex "${ARG[$id]}") ;;
+        tui | term) RCLASS[$id]="^org\\.omarchy\\.$(regex_escape "$id")\$" ;;
+        *) errors+=("linha $n ($id): regex_class auto só vale para webapp:, tui: e term:"); continue ;;
+      esac
+    fi
+    regexes+=("${RCLASS[$id]}")
+    regex_ids+=("$id:class")
+    if [[ -n $rtitle ]]; then
+      regexes+=("$rtitle")
+      regex_ids+=("$id:title")
+    fi
+  done <"$APPS_CONF"
+
+  if ((${#regexes[@]})); then
+    local -a verdicts=()
+    mapfile -t verdicts < <(printf '%s\n' "${regexes[@]}" | jq -Rr '. as $r | try (("" | test($r; "i")) | "ok") catch "bad"')
+    local i
+    for i in "${!regexes[@]}"; do
+      [[ ${verdicts[$i]:-bad} == ok ]] || errors+=("${regex_ids[$i]}: regex inválida \"${regexes[$i]}\"")
+    done
+  fi
+
+  if ((${#errors[@]})); then
+    printf 'iniciar: catálogo inválido em %s\n' "$APPS_CONF" >&2
+    printf '  - %s\n' "${errors[@]}" >&2
+    notify "Iniciar: catálogo inválido" "${errors[0]}"
+    exit 2
+  fi
+  ((${#IDS[@]})) || die 2 "catálogo vazio: $APPS_CONF"
+}
+
+webapp_class_regex() {
+  local url=$1 rest host path
+  rest=${url#*://}
+  host=${rest%%/*}
+  if [[ $rest == */* ]]; then path="/${rest#*/}"; else path="/"; fi
+  path=${path%%\?*}
+  # Chrome troca por "_" o que não for letra/dígito no nome do perfil ("Profile 1" -> Profile_1)
+  printf '^chrome-%s_%s-%s$' "$(regex_escape "$host")" "$(regex_escape "${path//\//_}")" "$(regex_escape "${CHROME_PROFILE//[^A-Za-z0-9]/_}")"
+}
+
+is_mise_wrapper() {
+  [[ -f $1 ]] && grep -q 'mise use -g' "$1" 2>/dev/null
+}
+
+resolve_entry() {
+  local id=$1 arg=${ARG[$1]} bin rest path real
+  bin=${arg%% *}
+  rest=""
+  [[ $arg == *" "* ]] && rest=" ${arg#* }"
+  AVAIL[$id]=1
+  WHY[$id]=""
+  MATCH_BIN[$id]=""
+  SLOW[$id]=0
+  [[ $arg == *grok-bot* || $arg == *macstudio-remote* || $arg == *vncviewer* ]] && SLOW[$id]=1
+
+  case ${KIND[$id]} in
+    webapp)
+      if ! command -v omarchy-launch-webapp >/dev/null; then
+        AVAIL[$id]=0; WHY[$id]="omarchy-launch-webapp ausente"
+      fi
+      LAUNCH[$id]="omarchy-launch-webapp $(shq "$arg") --profile-directory=$(shq "${PROF[$id]:-$CHROME_PROFILE}")"
+      ;;
+    tui)
+      MATCH_BIN[$id]=${bin##*/}
+      path=$(command -v "$bin" 2>/dev/null || true)
+      real=""
+      if [[ -n $path ]] && ! is_mise_wrapper "$path"; then
+        real=$path
+      else
+        # Never run a `mise use -g` wrapper: it can install or update software.
+        real=$(timeout 10 mise which "$bin" 2>/dev/null || true)
+      fi
+      if [[ -z $real || ! -x $real ]]; then
+        AVAIL[$id]=0; WHY[$id]="não instalado"
+      fi
+      LAUNCH[$id]="uwsm-app -- xdg-terminal-exec --app-id=org.omarchy.$id --dir=$(shq "$WORK_DIR") -e $(shq "$real")$rest"
+      ;;
+    term)
+      # A plain shell is not an identity: every generic terminal runs one.
+      case ${bin##*/} in
+        bash | sh | dash | zsh | fish) ;;
+        *) MATCH_BIN[$id]=${bin##*/} ;;
+      esac
+      if ! command -v "$bin" >/dev/null 2>&1; then
+        AVAIL[$id]=0; WHY[$id]="$bin ausente"
+      fi
+      LAUNCH[$id]="uwsm-app -- xdg-terminal-exec --app-id=org.omarchy.$id --dir=$(shq "$WORK_DIR") -e $arg"
+      ;;
+    app)
+      path=$(command -v "$bin" 2>/dev/null || true)
+      if [[ -z $path ]]; then
+        AVAIL[$id]=0; WHY[$id]="não instalado"
+      elif is_mise_wrapper "$path"; then
+        AVAIL[$id]=0; WHY[$id]="wrapper mise instalaria software"
+      fi
+      LAUNCH[$id]="uwsm-app -- $arg"
+      ;;
+    raw)
+      if ! command -v "$bin" >/dev/null 2>&1; then
+        AVAIL[$id]=0; WHY[$id]="$bin ausente"
+      fi
+      LAUNCH[$id]=$arg
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------- windows
+
+CLIENTS_JSON="[]"
+declare -A WIN_WS=() WIN_CHILDREN=() ASSIGNED=() PRE=()
+
+# Basenames of every argv token of the window process's direct children, so a
+# generic org.omarchy.agent window running claude/codex/... is recognized
+# (review 04). Script interpreters are covered because their script path is a
+# token too; .js/.mjs/.cjs suffixes are dropped for node entry points.
+child_tokens() {
+  local pid=$1 args tok out=""
+  local -a toks=()
+  while IFS= read -r args; do
+    read -r -a toks <<<"$args"
+    for tok in "${toks[@]}"; do
+      tok=${tok##*/}
+      tok=${tok%.js}
+      tok=${tok%.mjs}
+      tok=${tok%.cjs}
+      out+=" $tok"
+    done
+  done < <(ps -o args= --ppid "$pid" 2>/dev/null || true)
+  printf '%s ' "$out"
+}
+
+snapshot() {
+  local json addr ws term pid shared
+  json=$(timeout "$IPC_TIMEOUT" hyprctl clients -j 2>/dev/null) || return 1
+  jq -e 'type == "array"' >/dev/null 2>&1 <<<"$json" || return 1
+  CLIENTS_JSON=$json
+  WIN_WS=()
+  WIN_CHILDREN=()
+  # term=1 for terminal windows; shared=1 when several windows report the same
+  # pid (foot server mode): their children can't be told apart, so skip them.
+  while IFS=$'\t' read -r addr ws term pid shared; do
+    [[ -n $addr ]] || continue
+    WIN_WS[$addr]=$ws
+    [[ $term == 1 && $shared == 0 ]] && WIN_CHILDREN[$addr]=$(child_tokens "$pid")
+  done < <(jq -r --arg re "$TERMINAL_CLASS_RE" '
+    (group_by(.pid) | map(select(length > 1) | .[0].pid)) as $shared
+    | .[]
+    | [.address,
+       (.workspace.id | tostring),
+       (if (.class | test($re)) and (.class != "org.omarchy.iniciar") then "1" else "0" end),
+       (.pid | tostring),
+       (if (.pid as $p | $shared | index($p)) != null then "1" else "0" end)]
+    | @tsv' <<<"$CLIENTS_JSON")
+  return 0
+}
+
+# Addresses of windows that belong to id and are not yet claimed by another id.
+# With only_new=1, windows present before the launch (PRE) are ignored.
+matches_for() {
+  local id=$1 only_new=${2:-0} addr
+  local -a found=()
+  mapfile -t found < <(jq -r --arg rc "${RCLASS[$id]}" --arg rt "${RTITLE[$id]}" \
+    '.[] | select((.class | test($rc; "i")) and ($rt == "" or (.title | test($rt; "i")))) | .address' <<<"$CLIENTS_JSON")
+  if [[ -n ${MATCH_BIN[$id]} ]]; then
+    for addr in "${!WIN_CHILDREN[@]}"; do
+      # Exact binary name, or a versioned payload it execs (muse → muse-bin-1.2.1-…).
+      if [[ " ${WIN_CHILDREN[$addr]} " == *" ${MATCH_BIN[$id]} "* || " ${WIN_CHILDREN[$addr]} " == *" ${MATCH_BIN[$id]}-bin"* ]]; then
+        found+=("$addr")
+      fi
+    done
+  fi
+  declare -A seen=()
+  for addr in "${found[@]}"; do
+    [[ -n $addr && -z ${seen[$addr]+x} ]] || continue
+    seen[$addr]=1
+    [[ -n ${ASSIGNED[$addr]+x} && ${ASSIGNED[$addr]} != "$id" ]] && continue
+    [[ $only_new == 1 && -n ${PRE[$addr]+x} ]] && continue
+    printf '%s\n' "$addr"
+  done
+}
+
+move_window() {
+  hypr_dispatch "hl.dsp.window.move({ window = \"address:$1\", workspace = \"$2\", follow = false })"
+}
+
+# ---------------------------------------------------------------- selection state
+
+declare -a SELECTED=()
+declare -A IS_SELECTED=()
+
+load_selection() {
+  SELECTED=()
+  local id line
+  if [[ -f $STATE_FILE ]]; then
+    declare -A want=()
+    while IFS= read -r line || [[ -n $line ]]; do
+      line=$(trim "$line")
+      [[ -n $line ]] && want[$line]=1
+    done <"$STATE_FILE"
+    for id in "${IDS[@]}"; do
+      [[ -n ${want[$id]+x} ]] && SELECTED+=("$id")
+    done
+  else
+    for id in "${IDS[@]}"; do
+      [[ ${FAV[$id]} == 1 ]] && SELECTED+=("$id")
+    done
+  fi
+  return 0
+}
+
+saved_mode() {
+  local m=""
+  [[ -f $MODE_FILE ]] && m=$(trim "$(<"$MODE_FILE")")
+  case $m in mesas | pares | atual) printf '%s' "$m" ;; *) printf 'mesas' ;; esac
+}
+
+summary_by_mesa() {
+  local id m out=""
+  declare -A count=()
+  for id in "$@"; do
+    m=${MESA[$id]}
+    count[$m]=$((${count[$m]:-0} + 1))
+  done
+  for m in $(printf '%s\n' "${!count[@]}" | sort -n); do
+    out+="${out:+  ·  }Mesa $m${MESA_NAME[$m]:+ ${MESA_NAME[$m]}}: ${count[$m]}"
+  done
+  printf '%s' "${out:-nenhum app marcado}"
+}
+
+item_label() {
+  local id=$1 suffix=""
+  if [[ ${AVAIL[$id]} != 1 ]]; then
+    suffix="  ·  indisponível: ${WHY[$id]}"
+  elif [[ -n ${OPEN_AT[$id]:-} ]]; then
+    suffix="  ·  aberto na mesa ${OPEN_AT[$id]}"
+  fi
+  printf '%s  ·  %s  (mesa %s)%s' "${LABEL[$id]}" "${CAT[$id]}" "${MESA[$id]}" "${suffix//,/}"
+}
+
+# ---------------------------------------------------------------- UI
+
+declare -A OPEN_AT=()
+
+detect_open() {
+  local id addr
+  local -a addrs=()
+  OPEN_AT=()
+  ASSIGNED=()
+  for id in "${IDS[@]}"; do
+    mapfile -t addrs < <(matches_for "$id")
+    ((${#addrs[@]})) || continue
+    for addr in "${addrs[@]}"; do ASSIGNED[$addr]=$id; done
+    OPEN_AT[$id]=${WIN_WS[${addrs[0]}]}
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------- sessão salva
+#
+# save_session fotografa os apps abertos agora em $SESSION_FILE (linhas
+# "id mesa"), para recarregar depois com --sessao ou pela pergunta do
+# checklist. Feito para rodar a cada hora via systemd (iniciar-snapshot.timer).
+# ---------------------------------------------------------------- URLs do Discord na sessão
+# O save guarda, por app de navegador com URL discord.com/channels/@me, a URL
+# real do canal atual (lida do histórico do perfil). O restore abre essa URL
+# em vez do @me genérico, então a janela volta no mesmo canal/tópico.
+# Formato do last-session continua compatível: "id mesa [url]".
+
+valid_discord_url() {
+  [[ ${1:-} =~ ^https://discord\.com/channels/(@me/[0-9]+|[0-9]+/[0-9]+)$ ]]
+}
+
+# Ecoa "chrome:CAMINHO_DO_HISTORY" ou "firefox:CAMINHO_DO_PLACES" do perfil que
+# o app usa, ou falha (return 1) quando não dá para determinar.
+profile_history_db() {
+  local cmd=${LAUNCH[$1]} dir profile="Default" base
+  local NS='[^[:space:]"]'
+  if [[ $cmd == *firefox* ]]; then
+    if [[ $cmd =~ (-profile|--profile)[[:space:]]+($NS+) ]]; then
+      printf 'firefox:%s/places.sqlite' "${BASH_REMATCH[2]}"
+      return 0
+    fi
+    return 1
+  fi
+  case $cmd in
+    *google-chrome*) base=$HOME/.config/google-chrome ;;
+    *brave*) base=$HOME/.config/BraveSoftware/Brave-Browser ;;
+    *chromium*) base=$HOME/.config/chromium ;;
+    *microsoft-edge*|*msedge*) base=$HOME/.config/microsoft-edge ;;
+    *) return 1 ;;
+  esac
+  dir=$base
+  if [[ $cmd =~ --user-data-dir=($NS+) ]]; then
+    dir=${BASH_REMATCH[1]}
+  elif [[ $cmd =~ --user-data-dir[[:space:]]+($NS+) ]]; then
+    dir=${BASH_REMATCH[1]}
+  fi
+  if [[ $dir == \$HOME/* ]]; then dir=$HOME/${dir#\$HOME/}; fi
+  if [[ $dir == \~/* ]]; then dir=$HOME/${dir#\~/}; fi
+  if [[ $cmd =~ --profile-directory=($NS+) ]]; then
+    profile=${BASH_REMATCH[1]}
+  fi
+  printf 'chrome:%s/%s/History' "$dir" "$profile"
+  return 0
+}
+
+# URL atual do canal do Discord segundo o histórico do perfil (a visita mais
+# recente). Ecoa a URL validada ou nada. Nunca falha.
+latest_discord_url() {
+  local spec=$1 kind=${spec%%:*} db=${spec#*:} tmp url=""
+  [[ -f $db ]] || return 0
+  tmp=$(mktemp "${TMPDIR:-/tmp}/iniciar-hist.XXXXXX") || return 0
+  cp -f "$db" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+  cp -f "$db-wal" "$tmp-wal" 2>/dev/null || true
+  cp -f "$db-shm" "$tmp-shm" 2>/dev/null || true
+  if [[ $kind == firefox ]]; then
+    url=$(python3 - "$tmp" <<'PYEOF' 2>/dev/null
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+rows = con.execute("SELECT url FROM moz_places WHERE url LIKE 'https://discord.com/channels/%' ORDER BY last_visit_date DESC LIMIT 1").fetchall()
+print(rows[0][0] if rows else "")
+PYEOF
+)
+  else
+    url=$(python3 - "$tmp" <<'PYEOF' 2>/dev/null
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+rows = con.execute("SELECT url FROM urls WHERE url LIKE 'https://discord.com/channels/%' ORDER BY last_visit_time DESC LIMIT 1").fetchall()
+print(rows[0][0] if rows else "")
+PYEOF
+)
+  fi
+  rm -f "$tmp" "$tmp-wal" "$tmp-shm"
+  if valid_discord_url "${url:-}"; then printf '%s' "$url"; fi
+  return 0
+}
+
+# URL do canal para guardar na sessão do app, ou nada.
+session_url_for() {
+  local id=$1 spec
+  [[ ${LAUNCH[$id]:-} == *discord.com/channels/@me* ]] || return 0
+  spec=$(profile_history_db "$id") || return 0
+  latest_discord_url "$spec"
+  return 0
+}
+
+save_session() {
+  local id out="" n=0 surl=""
+  snapshot || { printf 'iniciar: Hyprland não respondeu; sessão não salva\n' >&2; return 1; }
+  detect_open
+  for id in "${IDS[@]}"; do
+    [[ -n ${OPEN_AT[$id]:-} ]] || continue
+    surl=$(session_url_for "$id")
+    out+="$id ${OPEN_AT[$id]}${surl:+ $surl}"$'\n'
+    n=$((n + 1))
+  done
+  write_atomic "$SESSION_FILE" "$out" || { printf 'iniciar: não consegui gravar %s\n' "$SESSION_FILE" >&2; return 1; }
+  printf 'Sessão salva (%d apps · %s): %s\n' "$n" "$(date '+%d/%m %H:%M')" "$SESSION_FILE"
+  return 0
+}
+
+declare -a SESS_IDS=()
+declare -A SESS_WS=()
+declare -A SESS_URL=()
+
+# Lê $SESSION_FILE para SESS_IDS/SESS_WS. Retorna 1 se ausente ou vazio.
+load_session_file() {
+  local line id ws
+  SESS_IDS=()
+  SESS_WS=()
+  SESS_URL=()
+  [[ -f $SESSION_FILE ]] || { printf 'Nenhuma sessão salva ainda (o salvamento é horário, com apps abertos).\n'; return 1; }
+  while IFS= read -r line || [[ -n $line ]]; do
+    read -r id ws surl <<<"$line" || true
+    [[ -n $id && -n ${MESA[$id]+x} && $ws =~ ^[1-9][0-9]*$ ]] || continue
+    SESS_IDS+=("$id")
+    SESS_WS[$id]=$ws
+    SESS_URL[$id]=""
+    if [[ -n ${surl:-} ]] && valid_discord_url "$surl"; then SESS_URL[$id]=$surl; fi
+  done <"$SESSION_FILE"
+  ((${#SESS_IDS[@]})) || { printf 'Sessão salva está vazia.\n'; return 1; }
+  return 0
+}
+
+session_summary() {
+  local n when
+  n=$(grep -c . "$SESSION_FILE" 2>/dev/null || true)
+  n=${n:-0}
+  when=$(date -r "$SESSION_FILE" '+%d/%m %H:%M' 2>/dev/null || echo ?)
+  printf '%s apps · %s' "$n" "$when"
+}
+
+# Pergunta sessão salva x checklist. Retorna 0 = usar sessão (SESS_IDS pronto),
+# 1 = seguir para o checklist, 130 = cancelado.
+ask_session_first() {
+  local rc=0 out
+  [[ -s $SESSION_FILE ]] || return 1
+  load_session_file >/dev/null || return 1
+  out=$(gum choose --header="Abrir a última sessão salva ou escolher apps?" \
+    "Última sessão ($(session_summary))"$'\tsessao' \
+    "Escolher apps (como sempre)"$'\tpick') || rc=$?
+  ((rc == 0)) || return 130
+  [[ $out == sessao ]]
+}
+
+# Returns 0 = open saved selection now, 1 = customize, 130 = cancel.
+# gum's --timeout is absolute: it fires even while the user is ticking boxes
+# and discards the changes (measured with gum 2.0.0), so autostart counts down
+# before the checklist instead; any key stops the countdown.
+autostart_countdown() {
+  local left=$AUTOSTART_SECONDS key rest
+  printf '\n  Iniciar sessão\n\n  Seleção salva: %s\n  Modo: %s\n\n' "$(summary_by_mesa "${SELECTED[@]}")" "${MODE_LABEL[$(saved_mode)]}"
+  while ((left > 0)); do
+    printf '\r\033[K  Abrindo em %2d s   ·   Enter abre agora   ·   outra tecla personaliza   ·   Esc cancela ' "$left"
+    if IFS= read -rsn1 -t 1 key; then
+      printf '\n'
+      case $key in
+        "") return 0 ;;
+        $'\e')
+          rest=""
+          IFS= read -rsn8 -t 0.05 rest || true
+          [[ -z $rest ]] && return 130
+          return 1
+          ;;
+        *) return 1 ;;
+      esac
+    fi
+    left=$((left - 1))
+  done
+  printf '\n'
+  return 0
+}
+
+choose_apps() {
+  local header lines height rc=0 out id
+  local -a args=() items=()
+  lines=$(tput lines 2>/dev/null || echo 30)
+  header="Iniciar sessão   ·   x marca/desmarca   ·   enter abre   ·   esc cancela"$'\n'"Seleção atual: $(summary_by_mesa "${SELECTED[@]}")"
+  height=$((lines - 6))
+  ((height < 5)) && height=5
+
+  args=(choose --no-limit --label-delimiter=$'\t' --height="$height" --header="$header"
+    --selected-prefix="[x] " --unselected-prefix="[ ] " --cursor-prefix="[ ] ")
+  for id in "${SELECTED[@]}"; do
+    args+=("--selected=$(item_label "$id")")
+  done
+  while IFS= read -r id; do
+    items+=("$(item_label "$id")"$'\t'"$id")
+  done < <(for id in "${IDS[@]}"; do printf '%s\t%s\n' "${MESA[$id]}" "$id"; done | sort -s -n -k1,1 | cut -f2)
+
+  out=$(gum "${args[@]}" "${items[@]}") || rc=$?
+  CHOSEN=()
+  case $rc in
+    0) ;;
+    *) return 130 ;;
+  esac
+  while IFS= read -r id; do
+    id=$(trim "$id")
+    [[ -n $id && -n ${MESA[$id]+x} ]] && CHOSEN+=("$id")
+  done <<<"$out"
+  return 0
+}
+
+choose_mode() {
+  local rc=0 out current
+  current=$(saved_mode)
+  out=$(gum choose --label-delimiter=$'\t' --header="Como abrir?" \
+    --selected="${MODE_LABEL[$current]}" \
+    "${MODE_LABEL[mesas]}"$'\t'mesas "${MODE_LABEL[pares]}"$'\t'pares "${MODE_LABEL[atual]}"$'\t'atual) || rc=$?
+  ((rc == 0)) || return 130
+  out=$(trim "$out")
+  case $out in mesas | pares | atual) CHOSEN_MODE=$out ;; *) return 130 ;; esac
+  return 0
+}
+
+# ---------------------------------------------------------------- run
+
+declare -a CHOSEN=() RESULTS=()
+CHOSEN_MODE=""
+
+run_selection() {
+  local mode=$1 active_ws=$2
+  shift 2
+  local -a ids=("$@")
+  local id idx=0 target addr opened=0 already=0 failed=0 unavailable=0 timeout_s deadline
+  local -a addrs=() failures=()
+
+  ASSIGNED=()
+  for id in "${ids[@]}"; do
+    case $mode in
+      mesas) target=${MESA[$id]} ;;
+      pares) target=$((PARES_START + idx / 2)) ;;
+      atual) target=$active_ws ;;
+      sessao) target=${SESS_WS[$id]:-${MESA[$id]}} ;;
+    esac
+    idx=$((idx + 1))
+
+    if ! snapshot; then
+      warn "${LABEL[$id]}: Hyprland não respondeu; nada foi feito com este app"
+      failed=$((failed + 1)); failures+=("${LABEL[$id]}")
+      RESULTS+=("$id falhou ipc")
+      continue
+    fi
+
+    mapfile -t addrs < <(matches_for "$id")
+    if ((${#addrs[@]})); then
+      for addr in "${addrs[@]}"; do
+        ASSIGNED[$addr]=$id
+        if [[ ${WIN_WS[$addr]} != "$target" ]]; then
+          move_window "$addr" "$target" || warn "${LABEL[$id]}: não consegui mover a janela $addr para a mesa $target"
+        fi
+      done
+      already=$((already + 1))
+      RESULTS+=("$id ja-aberto mesa=$target janelas=${#addrs[@]}")
+      continue
+    fi
+
+    if [[ ${AVAIL[$id]} != 1 ]]; then
+      warn "${LABEL[$id]}: indisponível (${WHY[$id]}); não foi aberto"
+      unavailable=$((unavailable + 1)); failures+=("${LABEL[$id]}")
+      RESULTS+=("$id indisponivel ${WHY[$id]}")
+      continue
+    fi
+
+    PRE=()
+    for addr in "${!WIN_WS[@]}"; do PRE[$addr]=1; done
+
+    local launch_cmd=${LAUNCH[$id]} restored_url=""
+    if [[ $mode == sessao && -n ${SESS_URL[$id]:-} ]]; then
+      launch_cmd=${launch_cmd//discord.com\/channels\/@me/${SESS_URL[$id]#https://}}
+      restored_url=" url-restaurada"
+    fi
+    if ! hypr_dispatch "hl.dsp.exec_cmd($(lua_string "$launch_cmd"), { workspace = \"$target silent\" })"; then
+      warn "${LABEL[$id]}: o Hyprland recusou o comando de abertura"
+      failed=$((failed + 1)); failures+=("${LABEL[$id]}")
+      RESULTS+=("$id falhou dispatch")
+      continue
+    fi
+
+    timeout_s=$POLL_TIMEOUT
+    [[ ${SLOW[$id]} == 1 ]] && timeout_s=$SLOW_TIMEOUT
+    deadline=$(($(now_ms) + timeout_s * 1000))
+    addrs=()
+    while (($(now_ms) < deadline)); do
+      sleep 0.25
+      snapshot || continue
+      mapfile -t addrs < <(matches_for "$id" 1)
+      ((${#addrs[@]})) && break
+    done
+
+    if ((${#addrs[@]} == 0)); then
+      if [[ ${ARG[$id]} == *macstudio-remote* ]]; then
+        warn "${LABEL[$id]}: nenhuma janela em ${timeout_s} s (confira o aplicativo e suas dependências)"
+      else
+        warn "${LABEL[$id]}: nenhuma janela em ${timeout_s} s"
+      fi
+      failed=$((failed + 1)); failures+=("${LABEL[$id]}")
+      RESULTS+=("$id sem-janela ${timeout_s}s")
+      continue
+    fi
+
+    local how="nasceu-na-mesa"
+    for addr in "${addrs[@]}"; do
+      ASSIGNED[$addr]=$id
+      if [[ ${WIN_WS[$addr]} != "$target" ]]; then
+        how="movida-da-mesa-${WIN_WS[$addr]}"
+        move_window "$addr" "$target" || warn "${LABEL[$id]}: não consegui mover a janela nova para a mesa $target"
+      fi
+    done
+    opened=$((opened + 1))
+    RESULTS+=("$id aberto mesa=$target $how$restored_url")
+  done
+
+  if ((opened + already > 0)) && [[ $mode != atual && $NO_FOCUS != 1 ]]; then
+    local first_desk=1
+    [[ $mode == pares ]] && first_desk=$PARES_START
+    hypr_dispatch "hl.dsp.focus({ workspace = \"$first_desk\" })" || true
+  fi
+
+  local body="$opened abertos · $already já estavam abertos · $((failed + unavailable)) falharam"
+  ((${#failures[@]})) && body+=$'\n'"Falharam: $(printf '%s; ' "${failures[@]}")"
+  printf '\n%s\n' "$body"
+  notify "Iniciar" "$body"
+
+  write_log "$mode" "$opened" "$already" "$((failed + unavailable))" "${ids[@]}"
+  return 0
+}
+
+write_log() {
+  local mode=$1 opened=$2 already=$3 failed=$4
+  shift 4
+  mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || return 0
+  {
+    printf 'iniciar %s  %s\n' "$VERSION" "$(date --iso-8601=seconds)"
+    printf 'modo: %s\nselecionados: %s\n' "$mode" "$*"
+    printf 'abertos=%s ja_abertos=%s falharam=%s\n' "$opened" "$already" "$failed"
+    printf 'resultado: %s\n' "${RESULTS[@]}"
+    ((${#WARNINGS[@]})) && printf 'aviso: %s\n' "${WARNINGS[@]}"
+  } >"$LOG_FILE" 2>/dev/null || true
+}
+
+# Pad by characters, not bytes (printf widths miscount accented labels).
+pad() {
+  local s=$1 width=$2
+  printf '%s%*s' "$s" $((width > ${#s} ? width - ${#s} : 0)) ""
+}
+
+list_catalog() {
+  local id state sel
+  snapshot || warn "Hyprland não respondeu; coluna ESTADO sem janelas"
+  detect_open
+  load_selection
+  IS_SELECTED=()
+  for id in "${SELECTED[@]}"; do IS_SELECTED[$id]=1; done
+  printf 'Catálogo: %s\nSeleção salva: %s\nModo salvo: %s\n\n' "$APPS_CONF" \
+    "$([[ -f $STATE_FILE ]] && echo "$STATE_FILE" || echo "nenhuma (usa favoritos)")" "$(saved_mode)"
+  printf '%-4s %-15s %s %-4s %-4s %s\n' MESA ID "$(pad "RÓTULO" 26)" FAV SEL ESTADO
+  for id in "${IDS[@]}"; do
+    if [[ ${AVAIL[$id]} != 1 ]]; then
+      state="indisponível: ${WHY[$id]}"
+    elif [[ -n ${OPEN_AT[$id]:-} ]]; then
+      state="aberto na mesa ${OPEN_AT[$id]}"
+    else
+      state="fechado"
+    fi
+    sel=""
+    [[ -n ${IS_SELECTED[$id]+x} ]] && sel="x"
+    printf '%-4s %-15s %s %-4s %-4s %s\n' "${MESA[$id]}" "$id" "$(pad "${LABEL[$id]}" 26)" "$([[ ${FAV[$id]} == 1 ]] && echo x)" "$sel" "$state"
+  done
+  printf '\nSeleção por mesa: %s\n' "$(summary_by_mesa "${SELECTED[@]}")"
+}
+
+usage() {
+  cat <<USAGE
+iniciar $VERSION — abre os apps do dia nas mesas do Hyprland.
+
+Uso: iniciar [opções]
+
+  (sem opções)       checklist com a última seleção marcada, depois escolhe o modo
+  --mode=MODO        pula a pergunta do modo: mesas | pares | atual
+  --last             abre a última seleção sem mostrar nada (usa o modo salvo)
+  --autostart        contagem de ${AUTOSTART_SECONDS} s; sem interação abre a seleção salva
+  --sessao           abre a última sessão salva (mesa de cada app como estava)
+  --save-session     fotografa os apps abertos agora (usado pelo timer horário)
+  --list             mostra catálogo, seleção salva e o que já está aberto
+  --edit             abre o catálogo no editor
+  --help             esta ajuda
+
+Arquivos: $APPS_CONF, $MESAS_CONF, $STATE_FILE, $MODE_FILE, $SESSION_FILE
+Log da última execução: $LOG_FILE
+USAGE
+}
+
+main() {
+  local action=run mode_arg="" last=0 autostart=0 sessao=0 a
+  for a in "$@"; do
+    case $a in
+      --mode=mesas | --mode=pares | --mode=atual) mode_arg=${a#--mode=} ;;
+      --mode=*) die 2 "modo inválido: ${a#--mode=} (use mesas, pares ou atual)" ;;
+      --last) last=1 ;;
+      --autostart) autostart=1 ;;
+      --sessao) sessao=1 ;;
+      --save-session) action=save ;;
+      --list) action=list ;;
+      --edit) action=edit ;;
+      -h | --help) action=help ;;
+      --version) printf 'iniciar %s\n' "$VERSION"; exit 0 ;;
+      *) die 2 "opção inválida: $a (veja iniciar --help)" ;;
+    esac
+  done
+
+  case $action in
+    help) usage; exit 0 ;;
+    edit)
+      ensure_config
+      exec omarchy-launch-editor "$APPS_CONF"
+      ;;
+  esac
+
+  ensure_config
+  [[ -f /usr/bin/omarchy-restart-gum || -n $(command -v omarchy-restart-gum) ]] && source omarchy-restart-gum 2>/dev/null || true
+  load_mesas
+  load_catalog
+  local id
+  for id in "${IDS[@]}"; do resolve_entry "$id"; done
+
+  if [[ $action == list ]]; then
+    list_catalog
+    exit 0
+  fi
+
+  if [[ $action == save ]]; then
+    mkdir -p "$(dirname "$LOCK_FILE")"
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || exit 0   # outra execução em curso; o próximo ciclo salva
+    save_session
+    exit $?
+  fi
+
+  mkdir -p "$(dirname "$LOCK_FILE")"
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    notify "Iniciar" "Já existe um Iniciar aberto."
+    die 75 "já existe outra execução do iniciar (trava $LOCK_FILE)"
+  fi
+
+  local active_ws
+  if [[ -n $ACTIVE_WS_OVERRIDE ]]; then
+    active_ws=$ACTIVE_WS_OVERRIDE
+  else
+    active_ws=$(timeout "$IPC_TIMEOUT" hyprctl activeworkspace -j 2>/dev/null | jq -r '.id' 2>/dev/null || true)
+  fi
+  [[ $active_ws =~ ^[1-9][0-9]*$ ]] || die 1 "não consegui ler a mesa ativa do Hyprland"
+  [[ $PARES_START =~ ^[1-9][0-9]*$ ]] || die 2 "INICIAR_PARES_INICIO precisa ser um número positivo"
+
+  snapshot || die 1 "Hyprland não respondeu (hyprctl clients)"
+  detect_open
+  load_selection
+
+  local mode chosen_ids=() rc
+  mode=$(saved_mode)
+  [[ -n $mode_arg ]] && mode=$mode_arg
+
+  if ((sessao)); then
+    load_session_file || exit 1
+    mode=sessao
+    chosen_ids=("${SESS_IDS[@]}")
+  elif ((last)); then
+    chosen_ids=("${SELECTED[@]}")
+  else
+    local customize=1
+    if ((autostart)); then
+      rc=0
+      autostart_countdown || rc=$?
+      case $rc in
+        0) customize=0; chosen_ids=("${SELECTED[@]}") ;;
+        130) printf 'Cancelado.\n'; exit 130 ;;
+      esac
+    fi
+    if ((customize)); then
+      rc=0
+      if ask_session_first; then
+        mode=sessao
+        chosen_ids=("${SESS_IDS[@]}")
+      else
+        rc=$?
+        if ((rc != 1)); then
+          printf 'Cancelado.\n'; exit 130
+        fi
+        rc=0
+        choose_apps || rc=$?
+        ((rc == 0)) || { printf 'Cancelado.\n'; exit 130; }
+        chosen_ids=("${CHOSEN[@]}")
+      fi
+      if ((${#chosen_ids[@]})) && [[ $mode != sessao && -z $mode_arg ]]; then
+        rc=0
+        choose_mode || rc=$?
+        ((rc == 0)) || { printf 'Cancelado.\n'; exit 130; }
+        mode=$CHOSEN_MODE
+      fi
+    fi
+  fi
+
+  # Persist only after full confirmation, before touching any window.
+  local state=""
+  ((${#chosen_ids[@]})) && state=$(printf '%s\n' "${chosen_ids[@]}")
+  write_atomic "$STATE_FILE" "$state" || die 1 "não consegui gravar $STATE_FILE"
+  if [[ $mode != sessao ]]; then
+    write_atomic "$MODE_FILE" "$mode"$'\n' || die 1 "não consegui gravar $MODE_FILE"
+  fi
+
+  if ((${#chosen_ids[@]} == 0)); then
+    printf 'Nenhum app marcado. Seleção vazia salva.\n'
+    exit 0
+  fi
+
+  ((${#chosen_ids[@]} > 20)) && [[ $mode == pares ]] &&
+    warn "modo pares com ${#chosen_ids[@]} apps usa mesas acima de 10; acesse pelo seletor de mesas"
+
+  printf 'Abrindo %d apps no modo %s...\n' "${#chosen_ids[@]}" "$mode"
+  run_selection "$mode" "$active_ws" "${chosen_ids[@]}"
+}
+
+main "$@"

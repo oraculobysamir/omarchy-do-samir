@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "samiriasbeck.lock-button",
+  "name": "Lock screen",
+  "version": "1.0.0",
+  "author": "samiriasbeck",
+  "license": "MIT",
+  "description": "One-click lock button for the Omarchy bar.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Lock",
+    "description": "Lock the screen immediately",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "center"
+  }
+}
